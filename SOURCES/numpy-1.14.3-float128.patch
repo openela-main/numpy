@@ -1,0 +1,2868 @@
+From 5c6a1415c8b227f10f388f2b2632afa96287fb49 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Nikola=20Forr=C3=B3?= <nforro@redhat.com>
+Date: Wed, 20 Mar 2019 15:52:48 +0100
+Subject: [PATCH] Fix broken float128 on all arches except x86_64
+
+Backport of the following upstream commits:
+
+3d21112d6 MAINT: Add bitmask helper functions
+4d7c529d7 MAINT: Reorganize Dragon4 code to clarify float formats
+727756e63 MAINT: replace static BigInts in dragon4 by dummy manager
+888d37086 MAINT: Add comments to long_double detection code
+cdc6b6847 BUG: Implement float128 dragon4 for IBM double-double (ppc64)
+718d9e866 ENH: Add support for the 64-bit RISC-V architecture
+b35dfc2d5 ENH: Add AARCH32 support.
+3973b2508 Adjust endianness header file to accommodate AARCHXX changes.
+f07359b22 BLD: Modify cpu detection and function to get build working on aarch64  (#11568)
+dd949d5c6 BUG: Fix printing of longdouble on ppc64le.
+641058fb7 MAINT: remove darwin hardcoded LDOUBLE detection
+ec843c700 BUG: Fix undefined functions on big-endian systems.
+00bc5bc88 BUG: Fix test sensitive to platform byte order.
+---
+ numpy/core/include/numpy/npy_cpu.h          |   30 +-
+ numpy/core/include/numpy/npy_endian.h       |   44 +-
+ numpy/core/setup.py                         |   13 +-
+ numpy/core/setup_common.py                  |   18 +-
+ numpy/core/src/multiarray/dragon4.c         | 1613 ++++++++++++-------
+ numpy/core/src/multiarray/dragon4.h         |   66 +-
+ numpy/core/src/multiarray/scalartypes.c.src |    5 +-
+ numpy/core/src/npymath/ieee754.c.src        |    3 +-
+ numpy/core/src/npymath/npy_math_private.h   |    9 +-
+ numpy/core/src/private/npy_config.h         |    3 +-
+ numpy/core/src/private/npy_fpmath.h         |   41 +-
+ numpy/core/tests/test_scalarprint.py        |   63 +-
+ numpy/core/tests/test_umath.py              |   12 +-
+ numpy/ma/tests/test_core.py                 |   11 +-
+ 14 files changed, 1277 insertions(+), 654 deletions(-)
+
+diff --git a/numpy/core/include/numpy/npy_cpu.h b/numpy/core/include/numpy/npy_cpu.h
+index 84653ea18..1109426da 100644
+--- a/numpy/core/include/numpy/npy_cpu.h
++++ b/numpy/core/include/numpy/npy_cpu.h
+@@ -17,6 +17,7 @@
+  *              NPY_CPU_SH_BE
+  *              NPY_CPU_ARCEL
+  *              NPY_CPU_ARCEB
++ *              NPY_CPU_RISCV64
+  */
+ #ifndef _NPY_CPUARCH_H_
+ #define _NPY_CPUARCH_H_
+@@ -60,10 +61,27 @@
+     #define NPY_CPU_HPPA
+ #elif defined(__alpha__)
+     #define NPY_CPU_ALPHA
+-#elif defined(__arm__) && defined(__ARMEL__)
+-    #define NPY_CPU_ARMEL
+-#elif defined(__arm__) && defined(__ARMEB__)
+-    #define NPY_CPU_ARMEB
++#elif defined(__arm__) || defined(__aarch64__)
++    #if defined(__ARMEB__) || defined(__AARCH64EB__)
++        #if defined(__ARM_32BIT_STATE)
++            #define NPY_CPU_ARMEB_AARCH32
++        #elif defined(__ARM_64BIT_STATE)
++            #define NPY_CPU_ARMEB_AARCH64
++        #else
++            #define NPY_CPU_ARMEB
++        #endif
++    #elif defined(__ARMEL__) || defined(__AARCH64EL__)
++        #if defined(__ARM_32BIT_STATE)
++            #define NPY_CPU_ARMEL_AARCH32
++        #elif defined(__ARM_64BIT_STATE)
++            #define NPY_CPU_ARMEL_AARCH64
++        #else
++            #define NPY_CPU_ARMEL
++        #endif
++    #else
++        # error Unknown ARM CPU, please report this to numpy maintainers with \
++	information about your platform (OS, CPU and compiler)
++    #endif
+ #elif defined(__sh__) && defined(__LITTLE_ENDIAN__)
+     #define NPY_CPU_SH_LE
+ #elif defined(__sh__) && defined(__BIG_ENDIAN__)
+@@ -74,14 +92,14 @@
+     #define NPY_CPU_MIPSEB
+ #elif defined(__or1k__)
+     #define NPY_CPU_OR1K
+-#elif defined(__aarch64__)
+-    #define NPY_CPU_AARCH64
+ #elif defined(__mc68000__)
+     #define NPY_CPU_M68K
+ #elif defined(__arc__) && defined(__LITTLE_ENDIAN__)
+     #define NPY_CPU_ARCEL
+ #elif defined(__arc__) && defined(__BIG_ENDIAN__)
+     #define NPY_CPU_ARCEB
++#elif defined(__riscv) && defined(__riscv_xlen) && __riscv_xlen == 64
++    #define NPY_CPU_RISCV64
+ #else
+     #error Unknown CPU, please report this to numpy maintainers with \
+     information about your platform (OS, CPU and compiler)
+diff --git a/numpy/core/include/numpy/npy_endian.h b/numpy/core/include/numpy/npy_endian.h
+index 1a42121db..44cdffd14 100644
+--- a/numpy/core/include/numpy/npy_endian.h
++++ b/numpy/core/include/numpy/npy_endian.h
+@@ -37,27 +37,31 @@
+     #define NPY_LITTLE_ENDIAN 1234
+     #define NPY_BIG_ENDIAN 4321
+ 
+-    #if defined(NPY_CPU_X86)            \
+-            || defined(NPY_CPU_AMD64)   \
+-            || defined(NPY_CPU_IA64)    \
+-            || defined(NPY_CPU_ALPHA)   \
+-            || defined(NPY_CPU_ARMEL)   \
+-            || defined(NPY_CPU_AARCH64) \
+-            || defined(NPY_CPU_SH_LE)   \
+-            || defined(NPY_CPU_MIPSEL)  \
+-            || defined(NPY_CPU_PPC64LE) \
+-            || defined(NPY_CPU_ARCEL)
++    #if defined(NPY_CPU_X86)                  \
++            || defined(NPY_CPU_AMD64)         \
++            || defined(NPY_CPU_IA64)          \
++            || defined(NPY_CPU_ALPHA)         \
++            || defined(NPY_CPU_ARMEL)         \
++            || defined(NPY_CPU_ARMEL_AARCH32) \
++            || defined(NPY_CPU_ARMEL_AARCH64) \
++            || defined(NPY_CPU_SH_LE)         \
++            || defined(NPY_CPU_MIPSEL)        \
++            || defined(NPY_CPU_PPC64LE)       \
++            || defined(NPY_CPU_ARCEL)         \
++            || defined(NPY_CPU_RISCV64)
+         #define NPY_BYTE_ORDER NPY_LITTLE_ENDIAN
+-    #elif defined(NPY_CPU_PPC)          \
+-            || defined(NPY_CPU_SPARC)   \
+-            || defined(NPY_CPU_S390)    \
+-            || defined(NPY_CPU_HPPA)    \
+-            || defined(NPY_CPU_PPC64)   \
+-            || defined(NPY_CPU_ARMEB)   \
+-            || defined(NPY_CPU_SH_BE)   \
+-            || defined(NPY_CPU_MIPSEB)  \
+-            || defined(NPY_CPU_OR1K)    \
+-            || defined(NPY_CPU_M68K)    \
++    #elif defined(NPY_CPU_PPC)                \
++            || defined(NPY_CPU_SPARC)         \
++            || defined(NPY_CPU_S390)          \
++            || defined(NPY_CPU_HPPA)          \
++            || defined(NPY_CPU_PPC64)         \
++            || defined(NPY_CPU_ARMEB)         \
++            || defined(NPY_CPU_ARMEB_AARCH32) \
++            || defined(NPY_CPU_ARMEB_AARCH64) \
++            || defined(NPY_CPU_SH_BE)         \
++            || defined(NPY_CPU_MIPSEB)        \
++            || defined(NPY_CPU_OR1K)          \
++            || defined(NPY_CPU_M68K)          \
+             || defined(NPY_CPU_ARCEB)
+         #define NPY_BYTE_ORDER NPY_BIG_ENDIAN
+     #else
+diff --git a/numpy/core/setup.py b/numpy/core/setup.py
+index 371df5bec..cc1bb5ba7 100644
+--- a/numpy/core/setup.py
++++ b/numpy/core/setup.py
+@@ -452,17 +452,8 @@ def configuration(parent_package='',top_path=None):
+                 moredefs.append(('NPY_RELAXED_STRIDES_DEBUG', 1))
+ 
+             # Get long double representation
+-            if sys.platform != 'darwin':
+-                rep = check_long_double_representation(config_cmd)
+-                if rep in ['INTEL_EXTENDED_12_BYTES_LE',
+-                           'INTEL_EXTENDED_16_BYTES_LE',
+-                           'MOTOROLA_EXTENDED_12_BYTES_BE',
+-                           'IEEE_QUAD_LE', 'IEEE_QUAD_BE',
+-                           'IEEE_DOUBLE_LE', 'IEEE_DOUBLE_BE',
+-                           'DOUBLE_DOUBLE_BE', 'DOUBLE_DOUBLE_LE']:
+-                    moredefs.append(('HAVE_LDOUBLE_%s' % rep, 1))
+-                else:
+-                    raise ValueError("Unrecognized long double format: %s" % rep)
++            rep = check_long_double_representation(config_cmd)
++            moredefs.append(('HAVE_LDOUBLE_%s' % rep, 1))
+ 
+             # Py3K check
+             if sys.version_info[0] == 3:
+diff --git a/numpy/core/setup_common.py b/numpy/core/setup_common.py
+index bd093c5c8..343318cd3 100644
+--- a/numpy/core/setup_common.py
++++ b/numpy/core/setup_common.py
+@@ -333,9 +333,9 @@ _MOTOROLA_EXTENDED_12B = ['300', '031', '000', '000', '353', '171',
+ _IEEE_QUAD_PREC_BE = ['300', '031', '326', '363', '105', '100', '000', '000',
+                       '000', '000', '000', '000', '000', '000', '000', '000']
+ _IEEE_QUAD_PREC_LE = _IEEE_QUAD_PREC_BE[::-1]
+-_DOUBLE_DOUBLE_BE = (['301', '235', '157', '064', '124', '000', '000', '000'] +
++_IBM_DOUBLE_DOUBLE_BE = (['301', '235', '157', '064', '124', '000', '000', '000'] +
+                      ['000'] * 8)
+-_DOUBLE_DOUBLE_LE = (['000', '000', '000', '124', '064', '157', '235', '301'] +
++_IBM_DOUBLE_DOUBLE_LE = (['000', '000', '000', '124', '064', '157', '235', '301'] +
+                      ['000'] * 8)
+ 
+ def long_double_representation(lines):
+@@ -362,11 +362,16 @@ def long_double_representation(lines):
+             # the long double
+             if read[-8:] == _AFTER_SEQ:
+                 saw = copy.copy(read)
++                # if the content was 12 bytes, we only have 32 - 8 - 12 = 12
++                # "before" bytes. In other words the first 4 "before" bytes went
++                # past the sliding window.
+                 if read[:12] == _BEFORE_SEQ[4:]:
+                     if read[12:-8] == _INTEL_EXTENDED_12B:
+                         return 'INTEL_EXTENDED_12_BYTES_LE'
+                     if read[12:-8] == _MOTOROLA_EXTENDED_12B:
+                         return 'MOTOROLA_EXTENDED_12_BYTES_BE'
++                # if the content was 16 bytes, we are left with 32-8-16 = 16
++                # "before" bytes, so 8 went past the sliding window.
+                 elif read[:8] == _BEFORE_SEQ[8:]:
+                     if read[8:-8] == _INTEL_EXTENDED_16B:
+                         return 'INTEL_EXTENDED_16_BYTES_LE'
+@@ -374,10 +379,11 @@ def long_double_representation(lines):
+                         return 'IEEE_QUAD_BE'
+                     elif read[8:-8] == _IEEE_QUAD_PREC_LE:
+                         return 'IEEE_QUAD_LE'
+-                    elif read[8:-8] == _DOUBLE_DOUBLE_BE:
+-                        return 'DOUBLE_DOUBLE_BE'
+-                    elif read[8:-8] == _DOUBLE_DOUBLE_LE:
+-                        return 'DOUBLE_DOUBLE_LE'
++                    elif read[8:-8] == _IBM_DOUBLE_DOUBLE_LE:
++                        return 'IBM_DOUBLE_DOUBLE_LE'
++                    elif read[8:-8] == _IBM_DOUBLE_DOUBLE_BE:
++                        return 'IBM_DOUBLE_DOUBLE_BE'
++                # if the content was 8 bytes, left with 32-8-8 = 16 bytes
+                 elif read[:16] == _BEFORE_SEQ:
+                     if read[16:-8] == _IEEE_DOUBLE_LE:
+                         return 'IEEE_DOUBLE_LE'
+diff --git a/numpy/core/src/multiarray/dragon4.c b/numpy/core/src/multiarray/dragon4.c
+index e005234a0..e3da79f40 100644
+--- a/numpy/core/src/multiarray/dragon4.c
++++ b/numpy/core/src/multiarray/dragon4.c
+@@ -42,6 +42,18 @@
+ #define DEBUG_ASSERT(stmnt) do {} while(0)
+ #endif
+ 
++static inline npy_uint64
++bitmask_u64(npy_uint32 n)
++{
++    return ~(~((npy_uint64)0) << n);
++}
++
++static inline npy_uint32
++bitmask_u32(npy_uint32 n)
++{
++    return ~(~((npy_uint32)0) << n);
++}
++
+ /*
+  *  Get the log base 2 of a 32-bit unsigned integer.
+  *  http://graphics.stanford.edu/~seander/bithacks.html#IntegerLogLookup
+@@ -102,6 +114,17 @@ LogBase2_64(npy_uint64 val)
+     return LogBase2_32((npy_uint32)val);
+ }
+ 
++#if defined(HAVE_LDOUBLE_IEEE_QUAD_LE) || defined(HAVE_LDOUBLE_IEEE_QUAD_BE)
++static npy_uint32
++LogBase2_128(npy_uint64 hi, npy_uint64 lo)
++{
++    if (hi) {
++        return 64 + LogBase2_64(hi);
++    }
++
++    return LogBase2_64(lo);
++}
++#endif /* HAVE_LDOUBLE_IEEE_QUAD_LE */
+ 
+ /*
+  * Maximum number of 32 bit blocks needed in high precision arithmetic to print
+@@ -122,6 +145,45 @@ typedef struct BigInt {
+     npy_uint32 blocks[c_BigInt_MaxBlocks];
+ } BigInt;
+ 
++/*
++ * Dummy implementation of a memory manager for BigInts. Currently, only
++ * supports a single call to Dragon4, but that is OK because Dragon4
++ * does not release the GIL.
++ *
++ * We try to raise an error anyway if dragon4 re-enters, and this code serves
++ * as a placeholder if we want to make it re-entrant in the future.
++ *
++ * Each call to dragon4 uses 7 BigInts.
++ */
++#define BIGINT_DRAGON4_GROUPSIZE 7
++typedef struct {
++    BigInt bigints[BIGINT_DRAGON4_GROUPSIZE];
++    char repr[16384];
++} Dragon4_Scratch;
++
++static int _bigint_static_in_use = 0;
++static Dragon4_Scratch _bigint_static;
++
++static Dragon4_Scratch*
++get_dragon4_bigint_scratch(void) {
++    /* this test+set is not threadsafe, but no matter because we have GIL */
++    if (_bigint_static_in_use) {
++        PyErr_SetString(PyExc_RuntimeError,
++            "numpy float printing code is not re-entrant. "
++            "Ping the devs to fix it.");
++        return NULL;
++    }
++    _bigint_static_in_use = 1;
++
++    /* in this dummy implementation we only return the static allocation */
++    return &_bigint_static;
++}
++
++static void
++free_dragon4_bigint_scratch(Dragon4_Scratch *mem){
++    _bigint_static_in_use = 0;
++}
++
+ /* Copy integer */
+ static void
+ BigInt_Copy(BigInt *dst, const BigInt *src)
+@@ -139,32 +201,86 @@ BigInt_Copy(BigInt *dst, const BigInt *src)
+ static void
+ BigInt_Set_uint64(BigInt *i, npy_uint64 val)
+ {
+-    if (val > 0xFFFFFFFF) {
+-        i->blocks[0] = val & 0xFFFFFFFF;
+-        i->blocks[1] = (val >> 32) & 0xFFFFFFFF;
++    if (val > bitmask_u64(32)) {
++        i->blocks[0] = val & bitmask_u64(32);
++        i->blocks[1] = (val >> 32) & bitmask_u64(32);
+         i->length = 2;
+     }
+     else if (val != 0) {
+-        i->blocks[0] = val & 0xFFFFFFFF;
++        i->blocks[0] = val & bitmask_u64(32);
++        i->length = 1;
++    }
++    else {
++        i->length = 0;
++    }
++}
++
++#if (defined(HAVE_LDOUBLE_IBM_DOUBLE_DOUBLE_LE) || \
++     defined(HAVE_LDOUBLE_IBM_DOUBLE_DOUBLE_BE) || \
++     defined(HAVE_LDOUBLE_IEEE_QUAD_LE) || \
++     defined(HAVE_LDOUBLE_IEEE_QUAD_BE))
++static void
++BigInt_Set_2x_uint64(BigInt *i, npy_uint64 hi, npy_uint64 lo)
++{
++    if (hi > bitmask_u64(32)) {
++        i->length = 4;
++    }
++    else if (hi != 0) {
++        i->length = 3;
++    }
++    else if (lo > bitmask_u64(32)) {
++        i->length = 2;
++    }
++    else if (lo != 0) {
+         i->length = 1;
+     }
+     else {
+         i->length = 0;
+     }
++
++    switch (i->length) {
++        case 4:
++            i->blocks[3] = (hi >> 32) & bitmask_u64(32);
++        case 3:
++            i->blocks[2] = hi & bitmask_u64(32);
++        case 2:
++            i->blocks[1] = (lo >> 32) & bitmask_u64(32);
++        case 1:
++            i->blocks[0] = lo & bitmask_u64(32);
++    }
+ }
++#endif /* DOUBLE_DOUBLE and QUAD */
+ 
+ static void
+ BigInt_Set_uint32(BigInt *i, npy_uint32 val)
+ {
+     if (val != 0) {
+         i->blocks[0] = val;
+-        i->length = (val != 0);
++        i->length = 1;
+     }
+     else {
+         i->length = 0;
+     }
+ }
+ 
++/*
++ * Returns 1 if the value is zero
++ */
++static int
++BigInt_IsZero(const BigInt *i)
++{
++    return i->length == 0;
++}
++
++/*
++ * Returns 1 if the value is even
++ */
++static int
++BigInt_IsEven(const BigInt *i)
++{
++    return (i->length == 0) || ( (i->blocks[0] % 2) == 0);
++}
++
+ /*
+  * Returns 0 if (lhs = rhs), negative if (lhs < rhs), positive if (lhs > rhs)
+  */
+@@ -228,7 +344,7 @@ BigInt_Add(BigInt *result, const BigInt *lhs, const BigInt *rhs)
+         npy_uint64 sum = carry + (npy_uint64)(*largeCur) +
+                                  (npy_uint64)(*smallCur);
+         carry = sum >> 32;
+-        *resultCur = sum & 0xFFFFFFFF;
++        *resultCur = sum & bitmask_u64(32);
+         ++largeCur;
+         ++smallCur;
+         ++resultCur;
+@@ -238,7 +354,7 @@ BigInt_Add(BigInt *result, const BigInt *lhs, const BigInt *rhs)
+     while (largeCur != largeEnd) {
+         npy_uint64 sum = carry + (npy_uint64)(*largeCur);
+         carry = sum >> 32;
+-        (*resultCur) = sum & 0xFFFFFFFF;
++        (*resultCur) = sum & bitmask_u64(32);
+         ++largeCur;
+         ++resultCur;
+     }
+@@ -307,13 +423,13 @@ BigInt_Multiply(BigInt *result, const BigInt *lhs, const BigInt *rhs)
+                 npy_uint64 product = (*resultCur) +
+                                      (*largeCur)*(npy_uint64)multiplier + carry;
+                 carry = product >> 32;
+-                *resultCur = product & 0xFFFFFFFF;
++                *resultCur = product & bitmask_u64(32);
+                 ++largeCur;
+                 ++resultCur;
+             } while(largeCur != large->blocks + large->length);
+ 
+             DEBUG_ASSERT(resultCur < result->blocks + maxResultLen);
+-            *resultCur = (npy_uint32)(carry & 0xFFFFFFFF);
++            *resultCur = (npy_uint32)(carry & bitmask_u64(32));
+         }
+     }
+ 
+@@ -337,7 +453,7 @@ BigInt_Multiply_int(BigInt *result, const BigInt *lhs, npy_uint32 rhs)
+     const npy_uint32 *pLhsEnd = lhs->blocks + lhs->length;
+     for ( ; pLhsCur != pLhsEnd; ++pLhsCur, ++resultCur) {
+         npy_uint64 product = (npy_uint64)(*pLhsCur) * rhs + carry;
+-        *resultCur = (npy_uint32)(product & 0xFFFFFFFF);
++        *resultCur = (npy_uint32)(product & bitmask_u64(32));
+         carry = product >> 32;
+     }
+ 
+@@ -414,7 +530,7 @@ BigInt_Multiply10(BigInt *result)
+     npy_uint32 *end = result->blocks + result->length;
+     for ( ; cur != end; ++cur) {
+         npy_uint64 product = (npy_uint64)(*cur) * 10ull + carry;
+-        (*cur) = (npy_uint32)(product & 0xFFFFFFFF);
++        (*cur) = (npy_uint32)(product & bitmask_u64(32));
+         carry = product >> 32;
+     }
+ 
+@@ -637,13 +753,11 @@ static BigInt g_PowerOf10_Big[] =
+ 
+ /* result = 10^exponent */
+ static void
+-BigInt_Pow10(BigInt *result, npy_uint32 exponent)
++BigInt_Pow10(BigInt *result, npy_uint32 exponent, BigInt *temp)
+ {
+-    /* create two temporary values to reduce large integer copy operations */
+-    BigInt temp1;
+-    BigInt temp2;
+-    BigInt *curTemp = &temp1;
+-    BigInt *pNextTemp = &temp2;
++    /* use two temporary values to reduce large integer copy operations */
++    BigInt *curTemp = result;
++    BigInt *pNextTemp = temp;
+     npy_uint32 smallExponent;
+     npy_uint32 tableIdx = 0;
+ 
+@@ -654,7 +768,7 @@ BigInt_Pow10(BigInt *result, npy_uint32 exponent)
+      * initialize the result by looking up a 32-bit power of 10 corresponding to
+      * the first 3 bits
+      */
+-    smallExponent = exponent & 0x7;
++    smallExponent = exponent & bitmask_u32(3);
+     BigInt_Set_uint32(curTemp, g_PowerOf10_U32[smallExponent]);
+ 
+     /* remove the low bits that we used for the 32-bit lookup table */
+@@ -681,19 +795,17 @@ BigInt_Pow10(BigInt *result, npy_uint32 exponent)
+     }
+ 
+     /* output the result */
+-    BigInt_Copy(result, curTemp);
++    if (curTemp != result) {
++        BigInt_Copy(result, curTemp);
++    }
+ }
+ 
+-/* result = in * 10^exponent */
++/* in = in * 10^exponent */
+ static void
+-BigInt_MultiplyPow10(BigInt *result, const BigInt *in, npy_uint32 exponent)
++BigInt_MultiplyPow10(BigInt *in, npy_uint32 exponent, BigInt *temp)
+ {
+-
+-    /* create two temporary values to reduce large integer copy operations */
+-    BigInt temp1;
+-    BigInt temp2;
+-    BigInt *curTemp = &temp1;
+-    BigInt *pNextTemp = &temp2;
++    /* use two temporary values to reduce large integer copy operations */
++    BigInt *curTemp, *pNextTemp;
+     npy_uint32 smallExponent;
+     npy_uint32 tableIdx = 0;
+ 
+@@ -704,12 +816,15 @@ BigInt_MultiplyPow10(BigInt *result, const BigInt *in, npy_uint32 exponent)
+      * initialize the result by looking up a 32-bit power of 10 corresponding to
+      * the first 3 bits
+      */
+-    smallExponent = exponent & 0x7;
++    smallExponent = exponent & bitmask_u32(3);
+     if (smallExponent != 0) {
+-        BigInt_Multiply_int(curTemp, in, g_PowerOf10_U32[smallExponent]);
++        BigInt_Multiply_int(temp, in, g_PowerOf10_U32[smallExponent]);
++        curTemp = temp;
++        pNextTemp = in;
+     }
+     else {
+-        BigInt_Copy(curTemp, in);
++        curTemp = in;
++        pNextTemp = temp;
+     }
+ 
+     /* remove the low bits that we used for the 32-bit lookup table */
+@@ -724,7 +839,7 @@ BigInt_MultiplyPow10(BigInt *result, const BigInt *in, npy_uint32 exponent)
+             /* multiply into the next temporary */
+             BigInt_Multiply(pNextTemp, curTemp, &g_PowerOf10_Big[tableIdx]);
+ 
+-            // swap to the next temporary
++            /* swap to the next temporary */
+             pSwap = curTemp;
+             curTemp = pNextTemp;
+             pNextTemp = pSwap;
+@@ -736,7 +851,9 @@ BigInt_MultiplyPow10(BigInt *result, const BigInt *in, npy_uint32 exponent)
+     }
+ 
+     /* output the result */
+-    BigInt_Copy(result, curTemp);
++    if (curTemp != in){
++        BigInt_Copy(in, curTemp);
++    }
+ }
+ 
+ /* result = 2^exponent */
+@@ -788,7 +905,7 @@ BigInt_DivideWithRemainder_MaxQuotient9(BigInt *dividend, const BigInt *divisor)
+      */
+     DEBUG_ASSERT(!divisor->length == 0 &&
+                 divisor->blocks[divisor->length-1] >= 8 &&
+-                divisor->blocks[divisor->length-1] < 0xFFFFFFFF &&
++                divisor->blocks[divisor->length-1] < bitmask_u64(32) &&
+                 dividend->length <= divisor->length);
+ 
+     /*
+@@ -825,10 +942,10 @@ BigInt_DivideWithRemainder_MaxQuotient9(BigInt *dividend, const BigInt *divisor)
+             carry = product >> 32;
+ 
+             difference = (npy_uint64)*dividendCur
+-                       - (product & 0xFFFFFFFF) - borrow;
++                       - (product & bitmask_u64(32)) - borrow;
+             borrow = (difference >> 32) & 1;
+ 
+-            *dividendCur = difference & 0xFFFFFFFF;
++            *dividendCur = difference & bitmask_u64(32);
+ 
+             ++divisorCur;
+             ++dividendCur;
+@@ -860,7 +977,7 @@ BigInt_DivideWithRemainder_MaxQuotient9(BigInt *dividend, const BigInt *divisor)
+                                   - (npy_uint64)*divisorCur - borrow;
+             borrow = (difference >> 32) & 1;
+ 
+-            *dividendCur = difference & 0xFFFFFFFF;
++            *dividendCur = difference & bitmask_u64(32);
+ 
+             ++divisorCur;
+             ++dividendCur;
+@@ -993,12 +1110,20 @@ BigInt_ShiftLeft(BigInt *result, npy_uint32 shift)
+  * There is some more documentation of these changes on Ryan Juckett's website
+  * at http://www.ryanjuckett.com/programming/printing-floating-point-numbers/
+  *
+- * Ryan Juckett's implementation did not implement "IEEE unbiased rounding",
+- * except in the last digit. This has been added back, following the Burger &
+- * Dybvig code, using the isEven variable.
++ * This code also has a few implementation differences from Ryan Juckett's
++ * version:
++ *  1. fixed overflow problems when mantissa was 64 bits (in float128 types),
++ *     by replacing multiplication by 2 or 4 by BigInt_ShiftLeft calls.
++ *  2. Increased c_BigInt_MaxBlocks, for 128-bit floats
++ *  3. Added more entries to the g_PowerOf10_Big table, for 128-bit floats.
++ *  4. Added unbiased rounding calculation with isEven. Ryan Juckett's
++ *     implementation did not implement "IEEE unbiased rounding", except in the
++ *     last digit. This has been added back, following the Burger & Dybvig
++ *     code, using the isEven variable.
+  *
+  * Arguments:
+- *   * mantissa - value significand
++ *   * bigints - memory to store all bigints needed (7) for dragon4 computation.
++ *               The first BigInt should be filled in with the mantissa.
+  *   * exponent - value exponent in base 2
+  *   * mantissaBit - index of the highest set mantissa bit
+  *   * hasUnequalMargins - is the high margin twice as large as the low margin
+@@ -1007,9 +1132,11 @@ BigInt_ShiftLeft(BigInt *result, npy_uint32 shift)
+  *   * pOutBuffer - buffer to output into
+  *   * bufferSize - maximum characters that can be printed to pOutBuffer
+  *   * pOutExponent - the base 10 exponent of the first digit
++ *
++ * Returns the number of digits written to the output buffer.
+  */
+ static npy_uint32
+-Dragon4(const npy_uint64 mantissa, const npy_int32 exponent,
++Dragon4(BigInt *bigints, const npy_int32 exponent,
+         const npy_uint32 mantissaBit, const npy_bool hasUnequalMargins,
+         const DigitMode digitMode, const CutoffMode cutoffMode,
+         npy_int32 cutoffNumber, char *pOutBuffer,
+@@ -1025,21 +1152,24 @@ Dragon4(const npy_uint64 mantissa, const npy_int32 exponent,
+      * Here, marginLow and marginHigh represent 1/2 of the distance to the next
+      * floating point value above/below the mantissa.
+      *
+-     * scaledMarginHigh is a pointer so that it can point to scaledMarginLow in
+-     * the case they must be equal to each other, otherwise it will point to
+-     * optionalMarginHigh.
++     * scaledMarginHigh will point to scaledMarginLow in the case they must be
++     * equal to each other, otherwise it will point to optionalMarginHigh.
+      */
+-    BigInt scale;
+-    BigInt scaledValue;
+-    BigInt scaledMarginLow;
++    BigInt *mantissa = &bigints[0];  /* the only initialized bigint */
++    BigInt *scale = &bigints[1];
++    BigInt *scaledValue = &bigints[2];
++    BigInt *scaledMarginLow = &bigints[3];
+     BigInt *scaledMarginHigh;
+-    BigInt optionalMarginHigh;
++    BigInt *optionalMarginHigh = &bigints[4];
++
++    BigInt *temp1 = &bigints[5];
++    BigInt *temp2 = &bigints[6];
+ 
+     const npy_float64 log10_2 = 0.30102999566398119521373889472449;
+     npy_int32 digitExponent, cutoffExponent, hiBlock;
+     npy_uint32 outputDigit;    /* current digit being output */
+     npy_uint32 outputLen;
+-    npy_bool isEven = (mantissa % 2) == 0;
++    npy_bool isEven = BigInt_IsEven(mantissa);
+     npy_int32 cmp;
+ 
+     /* values used to determine how to round */
+@@ -1048,12 +1178,14 @@ Dragon4(const npy_uint64 mantissa, const npy_int32 exponent,
+     DEBUG_ASSERT(bufferSize > 0);
+ 
+     /* if the mantissa is zero, the value is zero regardless of the exponent */
+-    if (mantissa == 0) {
++    if (BigInt_IsZero(mantissa)) {
+         *curDigit = '0';
+         *pOutExponent = 0;
+         return 1;
+     }
+ 
++    BigInt_Copy(scaledValue, mantissa);
++
+     if (hasUnequalMargins) {
+         /* if we have no fractional component */
+         if (exponent > 0) {
+@@ -1067,17 +1199,13 @@ Dragon4(const npy_uint64 mantissa, const npy_int32 exponent,
+              */
+ 
+             /* scaledValue      = 2 * 2 * mantissa*2^exponent */
+-            BigInt_Set_uint64(&scaledValue, mantissa);
+-            BigInt_ShiftLeft(&scaledValue, exponent + 2);
+-
++            BigInt_ShiftLeft(scaledValue, exponent + 2);
+             /* scale            = 2 * 2 * 1 */
+-            BigInt_Set_uint32(&scale,  4);
+-
++            BigInt_Set_uint32(scale,  4);
+             /* scaledMarginLow  = 2 * 2^(exponent-1) */
+-            BigInt_Pow2(&scaledMarginLow, exponent);
+-
++            BigInt_Pow2(scaledMarginLow, exponent);
+             /* scaledMarginHigh = 2 * 2 * 2^(exponent-1) */
+-            BigInt_Pow2(&optionalMarginHigh, exponent + 1);
++            BigInt_Pow2(optionalMarginHigh, exponent + 1);
+         }
+         /* else we have a fractional exponent */
+         else {
+@@ -1087,34 +1215,27 @@ Dragon4(const npy_uint64 mantissa, const npy_int32 exponent,
+              */
+ 
+             /* scaledValue      = 2 * 2 * mantissa */
+-            BigInt_Set_uint64(&scaledValue, mantissa);
+-            BigInt_ShiftLeft(&scaledValue, 2);
+-
++            BigInt_ShiftLeft(scaledValue, 2);
+             /* scale            = 2 * 2 * 2^(-exponent) */
+-            BigInt_Pow2(&scale, -exponent + 2);
+-
++            BigInt_Pow2(scale, -exponent + 2);
+             /* scaledMarginLow  = 2 * 2^(-1) */
+-            BigInt_Set_uint32(&scaledMarginLow, 1);
+-
++            BigInt_Set_uint32(scaledMarginLow, 1);
+             /* scaledMarginHigh = 2 * 2 * 2^(-1) */
+-            BigInt_Set_uint32(&optionalMarginHigh, 2);
++            BigInt_Set_uint32(optionalMarginHigh, 2);
+         }
+ 
+         /* the high and low margins are different */
+-        scaledMarginHigh = &optionalMarginHigh;
++        scaledMarginHigh = optionalMarginHigh;
+     }
+     else {
+         /* if we have no fractional component */
+         if (exponent > 0) {
+             /* scaledValue     = 2 * mantissa*2^exponent */
+-            BigInt_Set_uint64(&scaledValue, mantissa);
+-            BigInt_ShiftLeft(&scaledValue, exponent + 1);
+-
++            BigInt_ShiftLeft(scaledValue, exponent + 1);
+             /* scale           = 2 * 1 */
+-            BigInt_Set_uint32(&scale, 2);
+-
++            BigInt_Set_uint32(scale, 2);
+             /* scaledMarginLow = 2 * 2^(exponent-1) */
+-            BigInt_Pow2(&scaledMarginLow, exponent);
++            BigInt_Pow2(scaledMarginLow, exponent);
+         }
+         /* else we have a fractional exponent */
+         else {
+@@ -1124,18 +1245,15 @@ Dragon4(const npy_uint64 mantissa, const npy_int32 exponent,
+              */
+ 
+             /* scaledValue     = 2 * mantissa */
+-            BigInt_Set_uint64(&scaledValue, mantissa);
+-            BigInt_ShiftLeft(&scaledValue, 1);
+-
++            BigInt_ShiftLeft(scaledValue, 1);
+             /* scale           = 2 * 2^(-exponent) */
+-            BigInt_Pow2(&scale, -exponent + 1);
+-
++            BigInt_Pow2(scale, -exponent + 1);
+             /* scaledMarginLow = 2 * 2^(-1) */
+-            BigInt_Set_uint32(&scaledMarginLow, 1);
++            BigInt_Set_uint32(scaledMarginLow, 1);
+         }
+ 
+         /* the high and low margins are equal */
+-        scaledMarginHigh = &scaledMarginLow;
++        scaledMarginHigh = scaledMarginLow;
+     }
+ 
+     /*
+@@ -1158,6 +1276,9 @@ Dragon4(const npy_uint64 mantissa, const npy_int32 exponent,
+      *                                                 <= log10(v) + log10(2)
+      *  floor(log10(v)) < ceil((mantissaBit + exponent) * log10(2))
+      *                                                 <= floor(log10(v)) + 1
++     *
++     *  Warning: This calculation assumes npy_float64 is an IEEE-binary64
++     *  float. This line may need to be updated if this is not the case.
+      */
+     digitExponent = (npy_int32)(
+        ceil((npy_float64)((npy_int32)mantissaBit + exponent) * log10_2 - 0.69));
+@@ -1179,31 +1300,29 @@ Dragon4(const npy_uint64 mantissa, const npy_int32 exponent,
+     /* Divide value by 10^digitExponent. */
+     if (digitExponent > 0) {
+         /* A positive exponent creates a division so we multiply the scale. */
+-        BigInt temp;
+-        BigInt_MultiplyPow10(&temp, &scale, digitExponent);
+-        BigInt_Copy(&scale, &temp);
++        BigInt_MultiplyPow10(scale, digitExponent, temp1);
+     }
+     else if (digitExponent < 0) {
+         /*
+          * A negative exponent creates a multiplication so we multiply up the
+          * scaledValue, scaledMarginLow and scaledMarginHigh.
+          */
+-        BigInt pow10, temp;
+-        BigInt_Pow10(&pow10, -digitExponent);
++        BigInt *temp=temp1, *pow10=temp2;
++        BigInt_Pow10(pow10, -digitExponent, temp);
+ 
+-        BigInt_Multiply(&temp, &scaledValue, &pow10);
+-        BigInt_Copy(&scaledValue, &temp);
++        BigInt_Multiply(temp, scaledValue, pow10);
++        BigInt_Copy(scaledValue, temp);
+ 
+-        BigInt_Multiply(&temp, &scaledMarginLow, &pow10);
+-        BigInt_Copy(&scaledMarginLow, &temp);
++        BigInt_Multiply(temp, scaledMarginLow, pow10);
++        BigInt_Copy(scaledMarginLow, temp);
+ 
+-        if (scaledMarginHigh != &scaledMarginLow) {
+-            BigInt_Multiply2(scaledMarginHigh, &scaledMarginLow);
++        if (scaledMarginHigh != scaledMarginLow) {
++            BigInt_Multiply2(scaledMarginHigh, scaledMarginLow);
+         }
+     }
+ 
+     /* If (value >= 1), our estimate for digitExponent was too low */
+-    if (BigInt_Compare(&scaledValue, &scale) >= 0) {
++    if (BigInt_Compare(scaledValue, scale) >= 0) {
+         /*
+          * The exponent estimate was incorrect.
+          * Increment the exponent and don't perform the premultiply needed
+@@ -1217,10 +1336,10 @@ Dragon4(const npy_uint64 mantissa, const npy_int32 exponent,
+          * Multiply larger by the output base to prepare for the first loop
+          * iteration.
+          */
+-        BigInt_Multiply10(&scaledValue);
+-        BigInt_Multiply10(&scaledMarginLow);
+-        if (scaledMarginHigh != &scaledMarginLow) {
+-            BigInt_Multiply2(scaledMarginHigh, &scaledMarginLow);
++        BigInt_Multiply10(scaledValue);
++        BigInt_Multiply10(scaledMarginLow);
++        if (scaledMarginHigh != scaledMarginLow) {
++            BigInt_Multiply2(scaledMarginHigh, scaledMarginLow);
+         }
+     }
+ 
+@@ -1261,8 +1380,8 @@ Dragon4(const npy_uint64 mantissa, const npy_int32 exponent,
+      * to be less than or equal to 429496729 which is the highest number that
+      * can be multiplied by 10 without overflowing to a new block.
+      */
+-    DEBUG_ASSERT(scale.length > 0);
+-    hiBlock = scale.blocks[scale.length - 1];
++    DEBUG_ASSERT(scale->length > 0);
++    hiBlock = scale->blocks[scale->length - 1];
+     if (hiBlock < 8 || hiBlock > 429496729) {
+         npy_uint32 hiBlockLog2, shift;
+ 
+@@ -1280,11 +1399,11 @@ Dragon4(const npy_uint64 mantissa, const npy_int32 exponent,
+         DEBUG_ASSERT(hiBlockLog2 < 3 || hiBlockLog2 > 27);
+         shift = (32 + 27 - hiBlockLog2) % 32;
+ 
+-        BigInt_ShiftLeft(&scale, shift);
+-        BigInt_ShiftLeft(&scaledValue, shift);
+-        BigInt_ShiftLeft(&scaledMarginLow, shift);
+-        if (scaledMarginHigh != &scaledMarginLow) {
+-            BigInt_Multiply2(scaledMarginHigh, &scaledMarginLow);
++        BigInt_ShiftLeft(scale, shift);
++        BigInt_ShiftLeft(scaledValue, shift);
++        BigInt_ShiftLeft(scaledMarginLow, shift);
++        if (scaledMarginHigh != scaledMarginLow) {
++            BigInt_Multiply2(scaledMarginHigh, scaledMarginLow);
+         }
+     }
+ 
+@@ -1296,25 +1415,25 @@ Dragon4(const npy_uint64 mantissa, const npy_int32 exponent,
+          * terminate early.
+          */
+         for (;;) {
+-            BigInt scaledValueHigh;
++            BigInt *scaledValueHigh = temp1;
+ 
+             digitExponent = digitExponent-1;
+ 
+             /* divide out the scale to extract the digit */
+             outputDigit =
+-                BigInt_DivideWithRemainder_MaxQuotient9(&scaledValue, &scale);
++                BigInt_DivideWithRemainder_MaxQuotient9(scaledValue, scale);
+             DEBUG_ASSERT(outputDigit < 10);
+ 
+             /* update the high end of the value */
+-            BigInt_Add(&scaledValueHigh, &scaledValue, scaledMarginHigh);
++            BigInt_Add(scaledValueHigh, scaledValue, scaledMarginHigh);
+ 
+             /*
+              * stop looping if we are far enough away from our neighboring
+              * values or if we have reached the cutoff digit
+              */
+-            cmp = BigInt_Compare(&scaledValue, &scaledMarginLow);
++            cmp = BigInt_Compare(scaledValue, scaledMarginLow);
+             low = isEven ? (cmp <= 0) : (cmp < 0);
+-            cmp = BigInt_Compare(&scaledValueHigh, &scale);
++            cmp = BigInt_Compare(scaledValueHigh, scale);
+             high = isEven ? (cmp >= 0) : (cmp > 0);
+             if (low | high | (digitExponent == cutoffExponent))
+                 break;
+@@ -1324,10 +1443,10 @@ Dragon4(const npy_uint64 mantissa, const npy_int32 exponent,
+             ++curDigit;
+ 
+             /* multiply larger by the output base */
+-            BigInt_Multiply10(&scaledValue);
+-            BigInt_Multiply10(&scaledMarginLow);
+-            if (scaledMarginHigh != &scaledMarginLow) {
+-                BigInt_Multiply2(scaledMarginHigh, &scaledMarginLow);
++            BigInt_Multiply10(scaledValue);
++            BigInt_Multiply10(scaledMarginLow);
++            if (scaledMarginHigh != scaledMarginLow) {
++                BigInt_Multiply2(scaledMarginHigh, scaledMarginLow);
+             }
+         }
+     }
+@@ -1345,10 +1464,11 @@ Dragon4(const npy_uint64 mantissa, const npy_int32 exponent,
+ 
+             /* divide out the scale to extract the digit */
+             outputDigit =
+-                BigInt_DivideWithRemainder_MaxQuotient9(&scaledValue, &scale);
++                BigInt_DivideWithRemainder_MaxQuotient9(scaledValue, scale);
+             DEBUG_ASSERT(outputDigit < 10);
+ 
+-            if ((scaledValue.length == 0) | (digitExponent == cutoffExponent)) {
++            if ((scaledValue->length == 0) |
++                    (digitExponent == cutoffExponent)) {
+                 break;
+             }
+ 
+@@ -1357,7 +1477,7 @@ Dragon4(const npy_uint64 mantissa, const npy_int32 exponent,
+             ++curDigit;
+ 
+             /* multiply larger by the output base */
+-            BigInt_Multiply10(&scaledValue);
++            BigInt_Multiply10(scaledValue);
+         }
+     }
+ 
+@@ -1375,8 +1495,8 @@ Dragon4(const npy_uint64 mantissa, const npy_int32 exponent,
+          *  compare( scale * value, scale * 0.5 )
+          *  compare( 2 * scale * value, scale )
+          */
+-        BigInt_Multiply2_inplace(&scaledValue);
+-        compare = BigInt_Compare(&scaledValue, &scale);
++        BigInt_Multiply2_inplace(scaledValue);
++        compare = BigInt_Compare(scaledValue, scale);
+         roundDown = compare < 0;
+ 
+         /*
+@@ -1431,134 +1551,53 @@ Dragon4(const npy_uint64 mantissa, const npy_int32 exponent,
+ 
+ 
+ /*
+- * Helper union to decompose a 16-bit IEEE float.
+- * sign:      1 bit
+- * exponent:  5 bits
+- * mantissa: 10 bits
+- */
+-typedef union FloatUnion16
+-{
+-    npy_uint16 integer;
+-} FloatUnion16;
+-
+-npy_bool   IsNegative_F16(FloatUnion16 *v) { return (v->integer >> 15) != 0; }
+-npy_uint32 GetExponent_F16(FloatUnion16 *v) { return (v->integer >> 10) & 0x1F;}
+-npy_uint32 GetMantissa_F16(FloatUnion16 *v) { return v->integer & 0x3FF; }
+-
+-
+-/*
+- * Helper union to decompose a 32-bit IEEE float.
+- * sign:      1 bit
+- * exponent:  8 bits
+- * mantissa: 23 bits
+- */
+-typedef union FloatUnion32
+-{
+-    npy_float32 floatingPoint;
+-    npy_uint32 integer;
+-} FloatUnion32;
+-
+-npy_bool   IsNegative_F32(FloatUnion32 *v) { return (v->integer >> 31) != 0; }
+-npy_uint32 GetExponent_F32(FloatUnion32 *v) { return (v->integer >> 23) & 0xFF;}
+-npy_uint32 GetMantissa_F32(FloatUnion32 *v) { return v->integer & 0x7FFFFF; }
+-
+-/*
+- * Helper union to decompose a 64-bit IEEE float.
+- * sign:      1 bit
+- * exponent: 11 bits
+- * mantissa: 52 bits
+- */
+-typedef union FloatUnion64
+-{
+-    npy_float64 floatingPoint;
+-    npy_uint64 integer;
+-} FloatUnion64;
+-npy_bool   IsNegative_F64(FloatUnion64 *v) { return (v->integer >> 63) != 0; }
+-npy_uint32 GetExponent_F64(FloatUnion64 *v) { return (v->integer >> 52) & 0x7FF; }
+-npy_uint64 GetMantissa_F64(FloatUnion64 *v) { return v->integer & 0xFFFFFFFFFFFFFull; }
+-
+-/*
+- * Helper unions and datatype to decompose a 80-bit IEEE float
+- * sign:      1 bit,  second u64
+- * exponent: 15 bits, second u64
+- * intbit     1 bit,  first u64
+- * mantissa: 63 bits, first u64
+- */
+-
+-/*
+- * Since systems have different types of long doubles, and may not necessarily
+- * have a 128-byte format we can use to pass values around, here we create
+- * our own 128-bit storage type for convenience.
+- */
+-typedef struct FloatVal128 {
+-    npy_uint64 integer[2];
+-} FloatVal128;
+-npy_bool   IsNegative_F128(FloatVal128 *v) {
+-    return ((v->integer[1] >> 15) & 0x1) != 0;
+-}
+-npy_uint32 GetExponent_F128(FloatVal128 *v) { return v->integer[1] & 0x7FFF; }
+-npy_uint64 GetMantissa_F128(FloatVal128 *v) {
+-    return v->integer[0] &  0x7FFFFFFFFFFFFFFFull;
+-}
+-
+-/*
+- * then for each different definition of long double, we create a union to
+- * unpack the float data safely. We can then copy these integers to a
+- * FloatVal128.
++ * The FormatPositional and FormatScientific functions have been more
++ * significantly rewritten relative to Ryan Juckett's code.
++ *
++ * The binary16 and the various 128-bit float functions are new, and adapted
++ * from the 64 bit version. The python interface functions are new.
+  */
+-#ifdef NPY_FLOAT128
+-typedef union FloatUnion128
+-{
+-    npy_float128 floatingPoint;
+-    struct {
+-        npy_uint64 a;
+-        npy_uint16 b;
+-    } integer;
+-} FloatUnion128;
+-#endif
+-
+-#ifdef NPY_FLOAT96
+-typedef union FloatUnion96
+-{
+-    npy_float96 floatingPoint;
+-    struct {
+-        npy_uint64 a;
+-        npy_uint32 b;
+-    } integer;
+-} FloatUnion96;
+-#endif
+-
+-#ifdef NPY_FLOAT80
+-typedef union FloatUnion80
+-{
+-    npy_float80 floatingPoint;
+-    struct {
+-        npy_uint64 a;
+-        npy_uint16 b;
+-    } integer;
+-} FloatUnion80;
+-#endif
+ 
+ 
+-/*
+- * The main changes above this point, relative to Ryan Juckett's code, are:
+- *  1. fixed overflow problems when mantissa was 64 bits (in float128 types),
+- *     by replacing multiplication by 2 or 4 by BigInt_ShiftLeft calls.
+- *  2. Increased c_BigInt_MaxBlocks
+- *  3. Added more entries to the g_PowerOf10_Big table
+- *  4. Added unbiased rounding calculation with isEven
++/* Options struct for easy passing of Dragon4 options.
+  *
+- * Below this point, the FormatPositional and FormatScientific functions have
+- * been more significantly rewritten. The Dragon4_PrintFloat16 and
+- * Dragon4_PrintFloat128 functions are new, and were adapted from the 64 and 32
+- * bit versions. The python interfacing functions (in the header) are new.
++ *   scientific - boolean controlling whether scientific notation is used
++ *   digit_mode - whether to use unique or fixed fracional output
++ *   cutoff_mode - whether 'precision' refers to toal digits, or digits past
++ *                 the decimal point.
++ *   precision - When negative, prints as many digits as needed for a unique
++ *               number. When positive specifies the maximum number of
++ *               significant digits to print.
++ *   sign - whether to always show sign
++ *   trim_mode - how to treat trailing 0s and '.'. See TrimMode comments.
++ *   digits_left - pad characters to left of decimal point. -1 for no padding
++ *   digits_right - pad characters to right of decimal point. -1 for no padding.
++ *                  Padding adds whitespace until there are the specified
++ *                  number characters to sides of decimal point. Applies after
++ *                  trim_mode characters were removed. If digits_right is
++ *                  positive and the decimal point was trimmed, decimal point
++ *                  will be replaced by a whitespace character.
++ *   exp_digits - Only affects scientific output. If positive, pads the
++ *                exponent with 0s until there are this many digits. If
++ *                negative, only use sufficient digits.
+  */
+-
++typedef struct Dragon4_Options {
++    npy_bool scientific;
++    DigitMode digit_mode;
++    CutoffMode cutoff_mode;
++    npy_int32 precision;
++    npy_bool sign;
++    TrimMode trim_mode;
++    npy_int32 digits_left;
++    npy_int32 digits_right;
++    npy_int32 exp_digits;
++} Dragon4_Options;
+ 
+ /*
+  * Outputs the positive number with positional notation: ddddd.dddd
+  * The output is always NUL terminated and the output length (not including the
+  * NUL) is returned.
++ *
+  * Arguments:
+  *    buffer - buffer to output into
+  *    bufferSize - maximum characters that can be printed to buffer
+@@ -1567,20 +1606,11 @@ typedef union FloatUnion80
+  *    signbit - value of the sign position. Should be '+', '-' or ''
+  *    mantissaBit - index of the highest set mantissa bit
+  *    hasUnequalMargins - is the high margin twice as large as the low margin
+- *    precision - Negative prints as many digits as are needed for a unique
+- *                number. Positive specifies the maximum number of significant
+- *                digits to print past the decimal point.
+- *    trim_mode - how to treat trailing 0s and '.'. See TrimMode comments.
+- *    digits_left - pad characters to left of decimal point. -1 for no padding
+- *    digits_right - pad characters to right of decimal point. -1 for no padding
+- *                   padding adds whitespace until there are the specified
+- *                   number characters to sides of decimal point. Applies after
+- *                   trim_mode characters were removed. If digits_right is
+- *                   positive and the decimal point was trimmed, decimal point
+- *                   will be replaced by a whitespace character.
++ *
++ * See Dragon4_Options for description of remaining arguments.
+  */
+ static npy_uint32
+-FormatPositional(char *buffer, npy_uint32 bufferSize, npy_uint64 mantissa,
++FormatPositional(char *buffer, npy_uint32 bufferSize, BigInt *mantissa,
+                  npy_int32 exponent, char signbit, npy_uint32 mantissaBit,
+                  npy_bool hasUnequalMargins, DigitMode digit_mode,
+                  CutoffMode cutoff_mode, npy_int32 precision,
+@@ -1707,7 +1737,7 @@ FormatPositional(char *buffer, npy_uint32 bufferSize, npy_uint64 mantissa,
+ 
+     /* always add decimal point, except for DprZeros mode */
+     if (trim_mode != TrimMode_DptZeros && numFractionDigits == 0 &&
+-            pos < maxPrintLen){
++            pos < maxPrintLen) {
+         buffer[pos++] = '.';
+     }
+ 
+@@ -1745,7 +1775,7 @@ FormatPositional(char *buffer, npy_uint32 bufferSize, npy_uint64 mantissa,
+      * when rounding, we may still end up with trailing zeros. Remove them
+      * depending on trim settings.
+      */
+-    if (precision >= 0 && trim_mode != TrimMode_None && numFractionDigits > 0){
++    if (precision >= 0 && trim_mode != TrimMode_None && numFractionDigits > 0) {
+         while (buffer[pos-1] == '0') {
+             pos--;
+             numFractionDigits--;
+@@ -1779,7 +1809,7 @@ FormatPositional(char *buffer, npy_uint32 bufferSize, npy_uint64 mantissa,
+         npy_int32 shift = digits_left - (numWholeDigits + has_sign);
+         npy_int32 count = pos;
+ 
+-        if (count + shift > maxPrintLen){
++        if (count + shift > maxPrintLen) {
+             count = maxPrintLen - shift;
+         }
+ 
+@@ -1803,6 +1833,7 @@ FormatPositional(char *buffer, npy_uint32 bufferSize, npy_uint64 mantissa,
+  * Outputs the positive number with scientific notation: d.dddde[sign]ddd
+  * The output is always NUL terminated and the output length (not including the
+  * NUL) is returned.
++ *
+  * Arguments:
+  *    buffer - buffer to output into
+  *    bufferSize - maximum characters that can be printed to buffer
+@@ -1811,15 +1842,11 @@ FormatPositional(char *buffer, npy_uint32 bufferSize, npy_uint64 mantissa,
+  *    signbit - value of the sign position. Should be '+', '-' or ''
+  *    mantissaBit - index of the highest set mantissa bit
+  *    hasUnequalMargins - is the high margin twice as large as the low margin
+- *    precision - Negative prints as many digits as are needed for a unique
+- *                number. Positive specifies the maximum number of significant
+- *                digits to print past the decimal point.
+- *    trim_mode - how to treat trailing 0s and '.'. See TrimMode comments.
+- *    digits_left - pad characters to left of decimal point. -1 for no padding
+- *    exp_digits - pads exponent with zeros until it has this many digits
++ *
++ * See Dragon4_Options for description of remaining arguments.
+  */
+ static npy_uint32
+-FormatScientific (char *buffer, npy_uint32 bufferSize, npy_uint64 mantissa,
++FormatScientific (char *buffer, npy_uint32 bufferSize, BigInt *mantissa,
+                   npy_int32 exponent, char signbit, npy_uint32 mantissaBit,
+                   npy_bool hasUnequalMargins, DigitMode digit_mode,
+                   npy_int32 precision, TrimMode trim_mode,
+@@ -1844,7 +1871,7 @@ FormatScientific (char *buffer, npy_uint32 bufferSize, npy_uint64 mantissa,
+     leftchars = 1 + (signbit == '-' || signbit == '+');
+     if (digits_left > leftchars) {
+         int i;
+-        for (i = 0; i < digits_left - leftchars && bufferSize > 1; i++){
++        for (i = 0; i < digits_left - leftchars && bufferSize > 1; i++) {
+             *pCurOut = ' ';
+             pCurOut++;
+             --bufferSize;
+@@ -1892,7 +1919,7 @@ FormatScientific (char *buffer, npy_uint32 bufferSize, npy_uint64 mantissa,
+ 
+     /* always add decimal point, except for DprZeros mode */
+     if (trim_mode != TrimMode_DptZeros && numFractionDigits == 0 &&
+-            bufferSize > 1){
++            bufferSize > 1) {
+         *pCurOut = '.';
+         ++pCurOut;
+         --bufferSize;
+@@ -1931,7 +1958,7 @@ FormatScientific (char *buffer, npy_uint32 bufferSize, npy_uint64 mantissa,
+      * when rounding, we may still end up with trailing zeros. Remove them
+      * depending on trim settings.
+      */
+-    if (precision >= 0 && trim_mode != TrimMode_None && numFractionDigits > 0){
++    if (precision >= 0 && trim_mode != TrimMode_None && numFractionDigits > 0) {
+         --pCurOut;
+         while (*pCurOut == '0') {
+             --pCurOut;
+@@ -1972,7 +1999,7 @@ FormatScientific (char *buffer, npy_uint32 bufferSize, npy_uint64 mantissa,
+         DEBUG_ASSERT(printExponent < 100000);
+ 
+         /* get exp digits */
+-        for (i = 0; i < 5; i++){
++        for (i = 0; i < 5; i++) {
+             digits[i] = printExponent % 10;
+             printExponent /= 10;
+         }
+@@ -1981,7 +2008,7 @@ FormatScientific (char *buffer, npy_uint32 bufferSize, npy_uint64 mantissa,
+         }
+         exp_size = i;
+         /* write remaining digits to tmp buf */
+-        for (i = exp_size; i > 0; i--){
++        for (i = exp_size; i > 0; i--) {
+             exponentBuffer[2 + (exp_size-i)] = (char)('0' + digits[i-1]);
+         }
+ 
+@@ -2057,12 +2084,12 @@ PrintInfNan(char *buffer, npy_uint32 bufferSize, npy_uint64 mantissa,
+ 
+         /* only print sign for inf values (though nan can have a sign set) */
+         if (signbit == '+') {
+-            if (pos < maxPrintLen-1){
++            if (pos < maxPrintLen-1) {
+                 buffer[pos++] = '+';
+             }
+         }
+         else if (signbit == '-') {
+-            if (pos < maxPrintLen-1){
++            if (pos < maxPrintLen-1) {
+                 buffer[pos++] = '-';
+             }
+         }
+@@ -2080,7 +2107,9 @@ PrintInfNan(char *buffer, npy_uint32 bufferSize, npy_uint64 mantissa,
+         buffer[pos + printLen] = '\0';
+ 
+         /*
+-         * // XXX: Should we change this for numpy?
++         *  For numpy we ignore unusual mantissa values for nan, but keep this
++         *  code in case we change our mind later.
++         *
+          * // append HEX value
+          * if (maxPrintLen > 3) {
+          *     printLen += PrintHex(buffer+3, bufferSize-3, mantissa,
+@@ -2093,34 +2122,63 @@ PrintInfNan(char *buffer, npy_uint32 bufferSize, npy_uint64 mantissa,
+ }
+ 
+ /*
+- * These functions print a floating-point number as a decimal string.
+- * The output string is always NUL terminated and the string length (not
+- * including the NUL) is returned.
++ * The functions below format a floating-point numbers stored in particular
++ * formats,  as a decimal string.  The output string is always NUL terminated
++ * and the string length (not including the NUL) is returned.
++ *
++ * For 16, 32 and 64 bit floats we assume they are the IEEE 754 type.
++ * For 128 bit floats we account for different definitions.
+  *
+  * Arguments are:
+  *   buffer - buffer to output into
+  *   bufferSize - maximum characters that can be printed to buffer
+- *   value - value significand
+- *   scientific - boolean controlling whether scientific notation is used
+- *   precision - If positive, specifies the number of decimals to show after
+- *               decimal point. If negative, sufficient digits to uniquely
+- *               specify the float will be output.
+- *   trim_mode - how to treat trailing zeros and decimal point. See TrimMode.
+- *   digits_right - pad the result with '' on the right past the decimal point
+- *   digits_left - pad the result with '' on the right past the decimal point
+- *   exp_digits - Only affects scientific output. If positive, pads the
+- *                exponent with 0s until there are this many digits. If
+- *                negative, only use sufficient digits.
++ *   value - value to print
++ *   opt - Dragon4 options, see above
++ */
++
++/*
++ * Helper function that takes Dragon4 parameters and options and
++ * calls Dragon4.
+  */
+ static npy_uint32
+-Dragon4_PrintFloat16(char *buffer, npy_uint32 bufferSize, npy_uint16 value,
+-                     npy_bool scientific, DigitMode digit_mode,
+-                     CutoffMode cutoff_mode, npy_int32 precision,
+-                     npy_bool sign, TrimMode trim_mode, npy_int32 digits_left,
+-                     npy_int32 digits_right, npy_int32 exp_digits)
++Format_floatbits(char *buffer, npy_uint32 bufferSize, BigInt *mantissa,
++                 npy_int32 exponent, char signbit, npy_uint32 mantissaBit,
++                 npy_bool hasUnequalMargins, Dragon4_Options *opt)
+ {
+-    FloatUnion16 floatUnion;
+-    npy_uint32 floatExponent, floatMantissa;
++    /* format the value */
++    if (opt->scientific) {
++        return FormatScientific(buffer, bufferSize, mantissa, exponent,
++                                signbit, mantissaBit, hasUnequalMargins,
++                                opt->digit_mode, opt->precision,
++                                opt->trim_mode, opt->digits_left,
++                                opt->exp_digits);
++    }
++    else {
++        return FormatPositional(buffer, bufferSize, mantissa, exponent,
++                                signbit, mantissaBit, hasUnequalMargins,
++                                opt->digit_mode, opt->cutoff_mode,
++                                opt->precision, opt->trim_mode,
++                                opt->digits_left, opt->digits_right);
++    }
++}
++
++/*
++ * IEEE binary16 floating-point format
++ *
++ * sign:      1 bit
++ * exponent:  5 bits
++ * mantissa: 10 bits
++ */
++static npy_uint32
++Dragon4_PrintFloat_IEEE_binary16(
++        Dragon4_Scratch *scratch, npy_half *value, Dragon4_Options *opt)
++{
++    char *buffer = scratch->repr;
++    npy_uint32 bufferSize = sizeof(scratch->repr);
++    BigInt *bigints = scratch->bigints;
++
++    npy_uint16 val = *value;
++    npy_uint32 floatExponent, floatMantissa, floatSign;
+ 
+     npy_uint32 mantissa;
+     npy_int32 exponent;
+@@ -2138,20 +2196,20 @@ Dragon4_PrintFloat16(char *buffer, npy_uint32 bufferSize, npy_uint16 value,
+     }
+ 
+     /* deconstruct the floating point value */
+-    floatUnion.integer = value;
+-    floatExponent = GetExponent_F16(&floatUnion);
+-    floatMantissa = GetMantissa_F16(&floatUnion);
++    floatMantissa = val & bitmask_u32(10);
++    floatExponent = (val >> 10) & bitmask_u32(5);
++    floatSign = val >> 15;
+ 
+     /* output the sign */
+-    if (IsNegative_F16(&floatUnion)) {
++    if (floatSign != 0) {
+         signbit = '-';
+     }
+-    else if (sign) {
++    else if (opt->sign) {
+         signbit = '+';
+     }
+ 
+     /* if this is a special value */
+-    if (floatExponent == 0x1F) {
++    if (floatExponent == bitmask_u32(5)) {
+         return PrintInfNan(buffer, bufferSize, floatMantissa, 3, signbit);
+     }
+     /* else this is a number */
+@@ -2195,29 +2253,33 @@ Dragon4_PrintFloat16(char *buffer, npy_uint32 bufferSize, npy_uint16 value,
+         hasUnequalMargins  = NPY_FALSE;
+     }
+ 
+-    /* format the value */
+-    if (scientific) {
+-        return FormatScientific(buffer, bufferSize, mantissa, exponent, signbit,
+-                                mantissaBit, hasUnequalMargins, digit_mode,
+-                                precision, trim_mode, digits_left, exp_digits);
+-    }
+-    else {
+-        return FormatPositional(buffer, bufferSize, mantissa, exponent, signbit,
+-                                mantissaBit, hasUnequalMargins, digit_mode,
+-                                cutoff_mode, precision, trim_mode,
+-                                digits_left, digits_right);
+-    }
++    BigInt_Set_uint32(&bigints[0], mantissa);
++    return Format_floatbits(buffer, bufferSize, bigints, exponent,
++                            signbit, mantissaBit, hasUnequalMargins, opt);
+ }
+ 
++/*
++ * IEEE binary32 floating-point format
++ *
++ * sign:      1 bit
++ * exponent:  8 bits
++ * mantissa: 23 bits
++ */
+ static npy_uint32
+-Dragon4_PrintFloat32(char *buffer, npy_uint32 bufferSize, npy_float32 value,
+-                     npy_bool scientific, DigitMode digit_mode,
+-                     CutoffMode cutoff_mode, npy_int32 precision,
+-                     npy_bool sign, TrimMode trim_mode, npy_int32 digits_left,
+-                     npy_int32 digits_right, npy_int32 exp_digits)
++Dragon4_PrintFloat_IEEE_binary32(
++        Dragon4_Scratch *scratch, npy_float32 *value,
++        Dragon4_Options *opt)
+ {
+-    FloatUnion32 floatUnion;
+-    npy_uint32 floatExponent, floatMantissa;
++    char *buffer = scratch->repr;
++    npy_uint32 bufferSize = sizeof(scratch->repr);
++    BigInt *bigints = scratch->bigints;
++
++    union
++    {
++        npy_float32 floatingPoint;
++        npy_uint32 integer;
++    } floatUnion;
++    npy_uint32 floatExponent, floatMantissa, floatSign;
+ 
+     npy_uint32 mantissa;
+     npy_int32 exponent;
+@@ -2235,20 +2297,21 @@ Dragon4_PrintFloat32(char *buffer, npy_uint32 bufferSize, npy_float32 value,
+     }
+ 
+     /* deconstruct the floating point value */
+-    floatUnion.floatingPoint = value;
+-    floatExponent = GetExponent_F32(&floatUnion);
+-    floatMantissa = GetMantissa_F32(&floatUnion);
++    floatUnion.floatingPoint = *value;
++    floatMantissa = floatUnion.integer & bitmask_u32(23);
++    floatExponent = (floatUnion.integer >> 23) & bitmask_u32(8);
++    floatSign = floatUnion.integer >> 31;
+ 
+     /* output the sign */
+-    if (IsNegative_F32(&floatUnion)) {
++    if (floatSign != 0) {
+         signbit = '-';
+     }
+-    else if (sign) {
++    else if (opt->sign) {
+         signbit = '+';
+     }
+ 
+     /* if this is a special value */
+-    if (floatExponent == 0xFF) {
++    if (floatExponent == bitmask_u32(8)) {
+         return PrintInfNan(buffer, bufferSize, floatMantissa, 6, signbit);
+     }
+     /* else this is a number */
+@@ -2292,29 +2355,32 @@ Dragon4_PrintFloat32(char *buffer, npy_uint32 bufferSize, npy_float32 value,
+         hasUnequalMargins  = NPY_FALSE;
+     }
+ 
+-    /* format the value */
+-    if (scientific) {
+-        return FormatScientific(buffer, bufferSize, mantissa, exponent, signbit,
+-                                mantissaBit, hasUnequalMargins, digit_mode,
+-                                precision, trim_mode, digits_left, exp_digits);
+-    }
+-    else {
+-        return FormatPositional(buffer, bufferSize, mantissa, exponent, signbit,
+-                                mantissaBit, hasUnequalMargins, digit_mode,
+-                                cutoff_mode, precision, trim_mode,
+-                                digits_left, digits_right);
+-    }
++    BigInt_Set_uint32(&bigints[0], mantissa);
++    return Format_floatbits(buffer, bufferSize, bigints, exponent,
++                           signbit, mantissaBit, hasUnequalMargins, opt);
+ }
+ 
++/*
++ * IEEE binary64 floating-point format
++ *
++ * sign:      1 bit
++ * exponent: 11 bits
++ * mantissa: 52 bits
++ */
+ static npy_uint32
+-Dragon4_PrintFloat64(char *buffer, npy_uint32 bufferSize, npy_float64 value,
+-                     npy_bool scientific, DigitMode digit_mode,
+-                     CutoffMode cutoff_mode, npy_int32 precision,
+-                     npy_bool sign, TrimMode trim_mode, npy_int32 digits_left,
+-                     npy_int32 digits_right, npy_int32 exp_digits)
++Dragon4_PrintFloat_IEEE_binary64(
++        Dragon4_Scratch *scratch, npy_float64 *value, Dragon4_Options *opt)
+ {
+-    FloatUnion64 floatUnion;
+-    npy_uint32 floatExponent;
++    char *buffer = scratch->repr;
++    npy_uint32 bufferSize = sizeof(scratch->repr);
++    BigInt *bigints = scratch->bigints;
++
++    union
++    {
++        npy_float64 floatingPoint;
++        npy_uint64 integer;
++    } floatUnion;
++    npy_uint32 floatExponent, floatSign;
+     npy_uint64 floatMantissa;
+ 
+     npy_uint64 mantissa;
+@@ -2333,20 +2399,21 @@ Dragon4_PrintFloat64(char *buffer, npy_uint32 bufferSize, npy_float64 value,
+     }
+ 
+     /* deconstruct the floating point value */
+-    floatUnion.floatingPoint = value;
+-    floatExponent = GetExponent_F64(&floatUnion);
+-    floatMantissa = GetMantissa_F64(&floatUnion);
++    floatUnion.floatingPoint = *value;
++    floatMantissa = floatUnion.integer & bitmask_u64(52);
++    floatExponent = (floatUnion.integer >> 52) & bitmask_u32(11);
++    floatSign = floatUnion.integer >> 63;
+ 
+     /* output the sign */
+-    if (IsNegative_F64(&floatUnion)) {
++    if (floatSign != 0) {
+         signbit = '-';
+     }
+-    else if (sign) {
++    else if (opt->sign) {
+         signbit = '+';
+     }
+ 
+     /* if this is a special value */
+-    if (floatExponent == 0x7FF) {
++    if (floatExponent == bitmask_u32(11)) {
+         return PrintInfNan(buffer, bufferSize, floatMantissa, 13, signbit);
+     }
+     /* else this is a number */
+@@ -2390,28 +2457,48 @@ Dragon4_PrintFloat64(char *buffer, npy_uint32 bufferSize, npy_float64 value,
+         hasUnequalMargins   = NPY_FALSE;
+     }
+ 
+-    /* format the value */
+-    if (scientific) {
+-        return FormatScientific(buffer, bufferSize, mantissa, exponent, signbit,
+-                                mantissaBit, hasUnequalMargins, digit_mode,
+-                                precision, trim_mode, digits_left, exp_digits);
+-    }
+-    else {
+-        return FormatPositional(buffer, bufferSize, mantissa, exponent, signbit,
+-                                mantissaBit, hasUnequalMargins, digit_mode,
+-                                cutoff_mode, precision, trim_mode,
+-                                digits_left, digits_right);
+-    }
++    BigInt_Set_uint64(&bigints[0], mantissa);
++    return Format_floatbits(buffer, bufferSize, bigints, exponent,
++                            signbit, mantissaBit, hasUnequalMargins, opt);
+ }
+ 
++
++/*
++ * Since systems have different types of long doubles, and may not necessarily
++ * have a 128-byte format we can use to pass values around, here we create
++ * our own 128-bit storage type for convenience.
++ */
++typedef struct FloatVal128 {
++    npy_uint64 hi, lo;
++} FloatVal128;
++
++#if defined(HAVE_LDOUBLE_INTEL_EXTENDED_10_BYTES_LE) || \
++    defined(HAVE_LDOUBLE_INTEL_EXTENDED_12_BYTES_LE) || \
++    defined(HAVE_LDOUBLE_INTEL_EXTENDED_16_BYTES_LE) || \
++    defined(HAVE_LDOUBLE_MOTOROLA_EXTENDED_12_BYTES_BE)
++/*
++ * Intel's 80-bit IEEE extended precision floating-point format
++ *
++ * "long doubles" with this format are stored as 96 or 128 bits, but
++ * are equivalent to the 80 bit type with some zero padding on the high bits.
++ * This method expects the user to pass in the value using a 128-bit
++ * FloatVal128, so can support 80, 96, or 128 bit storage formats,
++ * and is endian-independent.
++ *
++ * sign:      1 bit,  second u64
++ * exponent: 15 bits, second u64
++ * intbit     1 bit,  first u64
++ * mantissa: 63 bits, first u64
++ */
+ static npy_uint32
+-Dragon4_PrintFloat128(char *buffer, npy_uint32 bufferSize, FloatVal128 value,
+-                      npy_bool scientific, DigitMode digit_mode,
+-                      CutoffMode cutoff_mode, npy_int32 precision,
+-                      npy_bool sign, TrimMode trim_mode, npy_int32 digits_left,
+-                      npy_int32 digits_right, npy_int32 exp_digits)
++Dragon4_PrintFloat_Intel_extended(
++    Dragon4_Scratch *scratch, FloatVal128 value, Dragon4_Options *opt)
+ {
+-    npy_uint32 floatExponent;
++    char *buffer = scratch->repr;
++    npy_uint32 bufferSize = sizeof(scratch->repr);
++    BigInt *bigints = scratch->bigints;
++
++    npy_uint32 floatExponent, floatSign;
+     npy_uint64 floatMantissa;
+ 
+     npy_uint64 mantissa;
+@@ -2429,20 +2516,27 @@ Dragon4_PrintFloat128(char *buffer, npy_uint32 bufferSize, FloatVal128 value,
+         return 0;
+     }
+ 
+-    /* deconstruct the floating point value */
+-    floatExponent = GetExponent_F128(&value);
+-    floatMantissa = GetMantissa_F128(&value);
++    /* deconstruct the floating point value (we ignore the intbit) */
++    floatMantissa = value.lo & bitmask_u64(63);
++    floatExponent = value.hi & bitmask_u32(15);
++    floatSign = (value.hi >> 15) & 0x1;
+ 
+     /* output the sign */
+-    if (IsNegative_F128(&value)) {
++    if (floatSign != 0) {
+         signbit = '-';
+     }
+-    else if (sign) {
++    else if (opt->sign) {
+         signbit = '+';
+     }
+ 
+     /* if this is a special value */
+-    if (floatExponent == 0x7FFF) {
++    if (floatExponent == bitmask_u32(15)) {
++        /*
++         * Note: Technically there are other special extended values defined if
++         * the intbit is 0, like Pseudo-Infinity, Pseudo-Nan, Quiet-NaN. We
++         * ignore all of these since they are not generated on modern
++         * processors. We treat Quiet-Nan as simply Nan.
++         */
+         return PrintInfNan(buffer, bufferSize, floatMantissa, 16, signbit);
+     }
+     /* else this is a number */
+@@ -2486,247 +2580,668 @@ Dragon4_PrintFloat128(char *buffer, npy_uint32 bufferSize, FloatVal128 value,
+         hasUnequalMargins   = NPY_FALSE;
+     }
+ 
+-    /* format the value */
+-    if (scientific) {
+-        return FormatScientific(buffer, bufferSize, mantissa, exponent, signbit,
+-                                mantissaBit, hasUnequalMargins, digit_mode,
+-                                precision, trim_mode, digits_left, exp_digits);
++    BigInt_Set_uint64(&bigints[0], mantissa);
++    return Format_floatbits(buffer, bufferSize, bigints, exponent,
++                            signbit, mantissaBit, hasUnequalMargins, opt);
++
++}
++
++#endif /* INTEL_EXTENDED group */
++
++
++#ifdef HAVE_LDOUBLE_INTEL_EXTENDED_10_BYTES_LE
++/*
++ * Intel's 80-bit IEEE extended precision format, 80-bit storage
++ *
++ * Note: It is not clear if a long double with 10-byte storage exists on any
++ * system. But numpy defines NPY_FLOAT80, so if we come across it, assume it is
++ * an Intel extended format.
++ */
++static npy_uint32
++Dragon4_PrintFloat_Intel_extended80(
++    Dragon4_Scratch *scratch, npy_float80 *value, Dragon4_Options *opt)
++{
++    FloatVal128 val128;
++    union {
++        npy_float80 floatingPoint;
++        struct {
++            npy_uint64 a;
++            npy_uint16 b;
++        } integer;
++    } buf80;
++
++    buf80.floatingPoint = *value;
++    /* Intel is little-endian */
++    val128.lo = buf80.integer.a;
++    val128.hi = buf80.integer.b;
++
++    return Dragon4_PrintFloat_Intel_extended(scratch, val128, opt);
++}
++#endif /* HAVE_LDOUBLE_INTEL_EXTENDED_10_BYTES_LE */
++
++#ifdef HAVE_LDOUBLE_INTEL_EXTENDED_12_BYTES_LE
++/* Intel's 80-bit IEEE extended precision format, 96-bit storage */
++static npy_uint32
++Dragon4_PrintFloat_Intel_extended96(
++    Dragon4_Scratch *scratch, npy_float96 *value, Dragon4_Options *opt)
++{
++    FloatVal128 val128;
++    union {
++        npy_float96 floatingPoint;
++        struct {
++            npy_uint64 a;
++            npy_uint32 b;
++        } integer;
++    } buf96;
++
++    buf96.floatingPoint = *value;
++    /* Intel is little-endian */
++    val128.lo = buf96.integer.a;
++    val128.hi = buf96.integer.b;
++
++    return Dragon4_PrintFloat_Intel_extended(scratch, val128, opt);
++}
++#endif /* HAVE_LDOUBLE_INTEL_EXTENDED_12_BYTES_LE */
++
++#ifdef HAVE_LDOUBLE_MOTOROLA_EXTENDED_12_BYTES_BE
++/* Motorola Big-endian equivalent of the Intel-extended 96 fp format */
++static npy_uint32
++Dragon4_PrintFloat_Motorola_extended96(
++    Dragon4_Scratch *scratch, npy_float96 *value, Dragon4_Options *opt)
++{
++    FloatVal128 val128;
++    union {
++        npy_float96 floatingPoint;
++        struct {
++            npy_uint64 a;
++            npy_uint32 b;
++        } integer;
++    } buf96;
++
++    buf96.floatingPoint = *value;
++    /* Motorola is big-endian */
++    val128.lo = buf96.integer.b;
++    val128.hi = buf96.integer.a >> 16;
++    /* once again we assume the int has same endianness as the float */
++
++    return Dragon4_PrintFloat_Intel_extended(scratch, val128, opt);
++}
++#endif /* HAVE_LDOUBLE_MOTOROLA_EXTENDED_12_BYTES_BE */
++
++
++#ifdef NPY_FLOAT128
++
++typedef union FloatUnion128
++{
++    npy_float128 floatingPoint;
++    struct {
++        npy_uint64 a;
++        npy_uint64 b;
++    } integer;
++} FloatUnion128;
++
++#ifdef HAVE_LDOUBLE_INTEL_EXTENDED_16_BYTES_LE
++/* Intel's 80-bit IEEE extended precision format, 128-bit storage */
++static npy_uint32
++Dragon4_PrintFloat_Intel_extended128(
++    Dragon4_Scratch *scratch, npy_float128 *value, Dragon4_Options *opt)
++{
++    FloatVal128 val128;
++    FloatUnion128 buf128;
++
++    buf128.floatingPoint = *value;
++    /* Intel is little-endian */
++    val128.lo = buf128.integer.a;
++    val128.hi = buf128.integer.b;
++
++    return Dragon4_PrintFloat_Intel_extended(scratch, val128, opt);
++}
++#endif /* HAVE_LDOUBLE_INTEL_EXTENDED_16_BYTES_LE */
++
++#if defined(HAVE_LDOUBLE_IEEE_QUAD_LE) || defined(HAVE_LDOUBLE_IEEE_QUAD_BE)
++/*
++ * IEEE binary128 floating-point format
++ *
++ * sign:       1 bit
++ * exponent:  15 bits
++ * mantissa: 112 bits
++ *
++ * Currently binary128 format exists on only a few CPUs, such as on the POWER9
++ * arch or aarch64. Because of this, this code has not been extensively tested.
++ * I am not sure if the arch also supports uint128, and C does not seem to
++ * support int128 literals. So we use uint64 to do manipulation.
++ */
++static npy_uint32
++Dragon4_PrintFloat_IEEE_binary128(
++    Dragon4_Scratch *scratch, FloatVal128 val128, Dragon4_Options *opt)
++{
++    char *buffer = scratch->repr;
++    npy_uint32 bufferSize = sizeof(scratch->repr);
++    BigInt *bigints = scratch->bigints;
++
++    npy_uint32 floatExponent, floatSign;
++
++    npy_uint64 mantissa_hi, mantissa_lo;
++    npy_int32 exponent;
++    npy_uint32 mantissaBit;
++    npy_bool hasUnequalMargins;
++    char signbit = '\0';
++
++    if (bufferSize == 0) {
++        return 0;
++    }
++
++    if (bufferSize == 1) {
++        buffer[0] = '\0';
++        return 0;
++    }
++
++    mantissa_hi = val128.hi & bitmask_u64(48);
++    mantissa_lo = val128.lo;
++    floatExponent = (val128.hi >> 48) & bitmask_u32(15);
++    floatSign = val128.hi >> 63;
++
++    /* output the sign */
++    if (floatSign != 0) {
++        signbit = '-';
++    }
++    else if (opt->sign) {
++        signbit = '+';
++    }
++
++    /* if this is a special value */
++    if (floatExponent == bitmask_u32(15)) {
++        npy_uint64 mantissa_zero = mantissa_hi == 0 && mantissa_lo == 0;
++        return PrintInfNan(buffer, bufferSize, !mantissa_zero, 16, signbit);
++    }
++    /* else this is a number */
++
++    /* factor the value into its parts */
++    if (floatExponent != 0) {
++        /*
++         * normal
++         * The floating point equation is:
++         *  value = (1 + mantissa/2^112) * 2 ^ (exponent-16383)
++         * We convert the integer equation by factoring a 2^112 out of the
++         * exponent
++         *  value = (1 + mantissa/2^112) * 2^112 * 2 ^ (exponent-16383-112)
++         *  value = (2^112 + mantissa) * 2 ^ (exponent-16383-112)
++         * Because of the implied 1 in front of the mantissa we have 112 bits of
++         * precision.
++         *   m = (2^112 + mantissa)
++         *   e = (exponent-16383+1-112)
++         *
++         *   Adding 2^112 to the mantissa is the same as adding 2^48 to the hi
++         *   64 bit part.
++         */
++        mantissa_hi         = (1ull << 48) | mantissa_hi;
++        /* mantissa_lo is unchanged */
++        exponent            = floatExponent - 16383 - 112;
++        mantissaBit         = 112;
++        hasUnequalMargins   = (floatExponent != 1) && (mantissa_hi == 0 &&
++                                                       mantissa_lo == 0);
+     }
+     else {
+-        return FormatPositional(buffer, bufferSize, mantissa, exponent, signbit,
+-                                mantissaBit, hasUnequalMargins, digit_mode,
+-                                cutoff_mode, precision, trim_mode,
+-                                digits_left, digits_right);
++        /*
++         * subnormal
++         * The floating point equation is:
++         *  value = (mantissa/2^112) * 2 ^ (1-16383)
++         * We convert the integer equation by factoring a 2^112 out of the
++         * exponent
++         *  value = (mantissa/2^112) * 2^112 * 2 ^ (1-16383-112)
++         *  value = mantissa * 2 ^ (1-16383-112)
++         * We have up to 112 bits of precision.
++         *   m = (mantissa)
++         *   e = (1-16383-112)
++         */
++        exponent            = 1 - 16383 - 112;
++        mantissaBit         = LogBase2_128(mantissa_hi, mantissa_lo);
++        hasUnequalMargins   = NPY_FALSE;
+     }
++
++    BigInt_Set_2x_uint64(&bigints[0], mantissa_hi, mantissa_lo);
++    return Format_floatbits(buffer, bufferSize, bigints, exponent,
++                            signbit, mantissaBit, hasUnequalMargins, opt);
+ }
+ 
+-PyObject *
+-Dragon4_Positional_AnySize(void *val, size_t size, DigitMode digit_mode,
+-                           CutoffMode cutoff_mode, int precision, int sign,
+-                           TrimMode trim, int pad_left, int pad_right)
++#if defined(HAVE_LDOUBLE_IEEE_QUAD_LE)
++static npy_uint32
++Dragon4_PrintFloat_IEEE_binary128_le(
++    Dragon4_Scratch *scratch, npy_float128 *value, Dragon4_Options *opt)
+ {
+-    /*
+-     * Use a very large buffer in case anyone tries to output a large numberG.
+-     * 16384 should be enough to uniquely print any float128, which goes up
+-     * to about 10^4932 */
+-    static char repr[16384];
+     FloatVal128 val128;
+-#ifdef NPY_FLOAT80
+-    FloatUnion80 buf80;;
+-#endif
+-#ifdef NPY_FLOAT96
+-    FloatUnion96 buf96;
+-#endif
+-#ifdef NPY_FLOAT128
+     FloatUnion128 buf128;
+-#endif
+ 
+-    switch (size) {
+-        case 2:
+-            Dragon4_PrintFloat16(repr, sizeof(repr), *(npy_float16*)val,
+-                                 0, digit_mode, cutoff_mode, precision,
+-                                 sign, trim, pad_left, pad_right, -1);
+-            break;
+-        case 4:
+-            Dragon4_PrintFloat32(repr, sizeof(repr), *(npy_float32*)val,
+-                                 0, digit_mode, cutoff_mode, precision,
+-                                 sign, trim, pad_left, pad_right, -1);
+-            break;
+-        case 8:
+-            Dragon4_PrintFloat64(repr, sizeof(repr), *(npy_float64*)val,
+-                                 0, digit_mode, cutoff_mode, precision,
+-                                 sign, trim, pad_left, pad_right, -1);
+-            break;
+-#ifdef NPY_FLOAT80
+-        case 10:
+-            buf80.floatingPoint = *(npy_float80*)val;
+-            val128.integer[0] = buf80.integer.a;
+-            val128.integer[1] = buf80.integer.b;
+-            Dragon4_PrintFloat128(repr, sizeof(repr), val128,
+-                                  0, digit_mode, cutoff_mode, precision,
+-                                  sign, trim, pad_left, pad_right, -1);
+-            break;
+-#endif
+-#ifdef NPY_FLOAT96
+-        case 12:
+-            buf96.floatingPoint = *(npy_float96*)val;
+-            val128.integer[0] = buf96.integer.a;
+-            val128.integer[1] = buf96.integer.b;
+-            Dragon4_PrintFloat128(repr, sizeof(repr), val128,
+-                                  0, digit_mode, cutoff_mode, precision,
+-                                  sign, trim, pad_left, pad_right, -1);
+-            break;
+-#endif
+-#ifdef NPY_FLOAT128
+-        case 16:
+-            buf128.floatingPoint = *(npy_float128*)val;
+-            val128.integer[0] = buf128.integer.a;
+-            val128.integer[1] = buf128.integer.b;
+-            Dragon4_PrintFloat128(repr, sizeof(repr), val128,
+-                                  0, digit_mode, cutoff_mode, precision,
+-                                  sign, trim, pad_left, pad_right, -1);
+-            break;
+-#endif
+-        default:
+-            PyErr_Format(PyExc_ValueError, "unexpected itemsize %zu", size);
+-            return NULL;
++    buf128.floatingPoint = *value;
++    val128.lo = buf128.integer.a;
++    val128.hi = buf128.integer.b;
++
++    return Dragon4_PrintFloat_IEEE_binary128(scratch, val128, opt);
++}
++#endif /* HAVE_LDOUBLE_IEEE_QUAD_LE */
++
++#if defined(HAVE_LDOUBLE_IEEE_QUAD_BE)
++/*
++ * This function is untested, very few, if any, architectures implement
++ * big endian IEEE binary128 floating point.
++ */
++static npy_uint32
++Dragon4_PrintFloat_IEEE_binary128_be(
++    Dragon4_Scratch *scratch, npy_float128 *value, Dragon4_Options *opt)
++{
++    FloatVal128 val128;
++    FloatUnion128 buf128;
++
++    buf128.floatingPoint = *value;
++    val128.lo = buf128.integer.b;
++    val128.hi = buf128.integer.a;
++
++    return Dragon4_PrintFloat_IEEE_binary128(scratch, val128, opt);
++}
++#endif /* HAVE_LDOUBLE_IEEE_QUAD_BE */
++
++#endif /* HAVE_LDOUBLE_IEEE_QUAD_LE | HAVE_LDOUBLE_IEEE_BE*/
++
++#if (defined(HAVE_LDOUBLE_IBM_DOUBLE_DOUBLE_LE) || \
++     defined(HAVE_LDOUBLE_IBM_DOUBLE_DOUBLE_BE))
++/*
++ * IBM extended precision 128-bit floating-point format, aka IBM double-double
++ *
++ * IBM's double-double type is a pair of IEEE binary64 values, which you add
++ * together to get a total value. The exponents are arranged so that the lower
++ * double is about 2^52 times smaller than the high one, and the nearest
++ * float64 value is simply the upper double, in which case the pair is
++ * considered "normalized" (not to confuse with "normal" and "subnormal"
++ * binary64 values). We assume normalized values. You can see the glibc's
++ * printf on ppc does so too by constructing un-normalized values to get
++ * strange behavior from the OS printf:
++ *
++ *     >>> from numpy.core._multiarray_tests import format_float_OSprintf_g
++ *     >>> x = np.array([0.3,0.3], dtype='f8').view('f16')[0]
++ *     >>> format_float_OSprintf_g(x, 2)
++ *     0.30
++ *     >>> format_float_OSprintf_g(2*x, 2)
++ *     1.20
++ *
++ * If we don't assume normalization, x should really print as 0.6.
++ *
++ * For normalized values gcc assumes that the total mantissa is no
++ * more than 106 bits (53+53), so we can drop bits from the second double which
++ * would be pushed past 106 when left-shifting by its exponent, as happens
++ * sometimes. (There has been debate about this, see
++ * https://gcc.gnu.org/bugzilla/show_bug.cgi?format=multiple&id=70117,
++ * https://sourceware.org/bugzilla/show_bug.cgi?id=22752 )
++ *
++ * Note: This function is for the IBM-double-double which is a pair of IEEE
++ * binary64 floats, like on ppc64 systems. This is *not* the hexadecimal
++ * IBM-double-double type, which is a pair of IBM hexadecimal64 floats.
++ *
++ * See also:
++ * https://gcc.gnu.org/wiki/Ieee128PowerPCA
++ * https://www.ibm.com/support/knowledgecenter/en/ssw_aix_71/com.ibm.aix.genprogc/128bit_long_double_floating-point_datatype.htm
++ */
++static npy_uint32
++Dragon4_PrintFloat_IBM_double_double(
++    Dragon4_Scratch *scratch, npy_float128 *value, Dragon4_Options *opt)
++{
++    char *buffer = scratch->repr;
++    npy_uint32 bufferSize = sizeof(scratch->repr);
++    BigInt *bigints = scratch->bigints;
++
++    FloatVal128 val128;
++    FloatUnion128 buf128;
++
++    npy_uint32 floatExponent1, floatExponent2;
++    npy_uint64 floatMantissa1, floatMantissa2;
++    npy_uint32 floatSign1, floatSign2;
++
++    npy_uint64 mantissa1, mantissa2;
++    npy_int32 exponent1, exponent2;
++    int shift;
++    npy_uint32 mantissaBit;
++    npy_bool hasUnequalMargins;
++    char signbit = '\0';
++
++    if (bufferSize == 0) {
++        return 0;
++    }
++
++    if (bufferSize == 1) {
++        buffer[0] = '\0';
++        return 0;
++    }
++
++    /* The high part always comes before the low part, regardless of the
++     * endianness of the system. */
++    buf128.floatingPoint = *value;
++    val128.hi = buf128.integer.a;
++    val128.lo = buf128.integer.b;
++
++    /* deconstruct the floating point values */
++    floatMantissa1 = val128.hi & bitmask_u64(52);
++    floatExponent1 = (val128.hi >> 52) & bitmask_u32(11);
++    floatSign1 = (val128.hi >> 63) != 0;
++
++    floatMantissa2 = val128.lo & bitmask_u64(52);
++    floatExponent2 = (val128.lo >> 52) & bitmask_u32(11);
++    floatSign2 = (val128.lo >> 63) != 0;
++
++    /* output the sign using 1st float's sign */
++    if (floatSign1) {
++        signbit = '-';
++    }
++    else if (opt->sign) {
++        signbit = '+';
++    }
++
++    /* we only need to look at the first float for inf/nan */
++    if (floatExponent1 == bitmask_u32(11)) {
++        return PrintInfNan(buffer, bufferSize, floatMantissa1, 13, signbit);
++    }
++
++    /* else this is a number */
++
++    /* Factor the 1st value into its parts, see binary64 for comments. */
++    if (floatExponent1 == 0) {
++        /*
++         * If the first number is a subnormal value, the 2nd has to be 0 for
++         * the float128 to be normalized, so we can ignore it. In this case
++         * the float128 only has the precision of a single binary64 value.
++         */
++        mantissa1            = floatMantissa1;
++        exponent1            = 1 - 1023 - 52;
++        mantissaBit          = LogBase2_64(mantissa1);
++        hasUnequalMargins    = NPY_FALSE;
++
++        BigInt_Set_uint64(&bigints[0], mantissa1);
++    }
++    else {
++        mantissa1            = (1ull << 52) | floatMantissa1;
++        exponent1            = floatExponent1 - 1023 - 52;
++        mantissaBit          = 52 + 53;
++
++        /*
++         * Computing hasUnequalMargins and mantissaBit:
++         * This is a little trickier than for IEEE formats.
++         *
++         * When both doubles are "normal" it is clearer since we can think of
++         * it as an IEEE type with a 106 bit mantissa. This value can never
++         * have "unequal" margins because of the implied 1 bit in the 2nd
++         * value.  (unequal margins only happen when the mantissa has a value
++         * like "10000000000...", all zeros except the implied bit at the
++         * start, since the next lowest number has a different exponent).
++         * mantissaBits will always be 52+53 in this case.
++         *
++         * If the 1st number is a very small normal, and the 2nd is subnormal
++         * and not 2^52 times smaller, the number behaves like a subnormal
++         * overall, where the upper number just adds some bits on the left.
++         * Like usual subnormals, it has "equal" margins. The slightly tricky
++         * thing is that the number of mantissaBits varies. It will be 52
++         * (from lower double) plus a variable number depending on the upper
++         * number's exponent. We recompute the number of bits in the shift
++         * calculation below, because the shift will be equal to the number of
++         * lost bits.
++         *
++         * We can get unequal margins only if the first value has all-0
++         * mantissa (except implied bit), and the second value is exactly 0. As
++         * a special exception the smallest normal value (smallest exponent, 0
++         * mantissa) should have equal margins, since it is "next to" a
++         * subnormal value.
++         */
++
++        /* factor the 2nd value into its parts */
++        if (floatExponent2 != 0) {
++            mantissa2            = (1ull << 52) | floatMantissa2;
++            exponent2            = floatExponent2 - 1023 - 52;
++            hasUnequalMargins    = NPY_FALSE;
++        }
++        else {
++            /* shift exp by one so that leading mantissa bit is still bit 53 */
++            mantissa2            = floatMantissa2 << 1;
++            exponent2            = - 1023 - 52;
++            hasUnequalMargins  = (floatExponent1 != 1) && (floatMantissa1 == 0)
++                                                       && (floatMantissa2 == 0);
++        }
++
++        /*
++         * The 2nd val's exponent might not be exactly 52 smaller than the 1st,
++         * it can vary a little bit. So do some shifting of the low mantissa,
++         * so that the total mantissa is equivalent to bits 53 to 0 of the
++         * first double immediately followed by bits 53 to 0 of the second.
++         */
++        shift = exponent1 - exponent2 - 53;
++        if (shift > 0) {
++            /* shift more than 64 is undefined behavior */
++            mantissa2 = shift < 64 ? mantissa2 >> shift : 0;
++        }
++        else if (shift < 0) {
++            /*
++             * This only happens if the 2nd value is subnormal.
++             * We expect that shift > -64, but check it anyway
++             */
++            mantissa2 = -shift < 64 ? mantissa2 << -shift : 0;
++        }
++
++        /*
++         * If the low double is a different sign from the high double,
++         * rearrange so that the total mantissa is the sum of the two
++         * mantissas, instead of a subtraction.
++         * hi - lo  ->  (hi-1) + (1-lo),   where lo < 1
++         */
++        if (floatSign1 != floatSign2 && mantissa2 != 0) {
++            mantissa1--;
++            mantissa2 = (1ull << 53) - mantissa2;
++        }
++
++        /*
++         * Compute the number of bits if we are in the subnormal range.
++         * The value "shift" happens to be exactly the number of lost bits.
++         * Also, shift the bits so that the least significant bit is at
++         * bit position 0, like a typical subnormal. After this exponent1
++         * should always be 2^-1022
++         */
++        if (shift < 0) {
++            mantissa2 = (mantissa2 >> -shift) | (mantissa1 << (53 + shift));
++            mantissa1 = mantissa1 >> -shift;
++            mantissaBit = mantissaBit -(-shift);
++            exponent1 -= shift;
++            DEBUG_ASSERT(exponent1 == -1022);
++        }
++
++        /*
++         * set up the BigInt mantissa, by shifting the parts as needed
++         * We can use | instead of + since the mantissas should not overlap
++         */
++        BigInt_Set_2x_uint64(&bigints[0], mantissa1 >> 11,
++                                         (mantissa1 << 53) | (mantissa2));
++        exponent1 = exponent1 - 53;
+     }
+ 
+-    return PyUString_FromString(repr);
++    return Format_floatbits(buffer, bufferSize, bigints, exponent1,
++                            signbit, mantissaBit, hasUnequalMargins, opt);
+ }
+ 
++#endif /* HAVE_LDOUBLE_IBM_DOUBLE_DOUBLE_LE | HAVE_LDOUBLE_IBM_DOUBLE_DOUBLE_BE */
++
++#endif /* NPY_FLOAT128 */
++
++
++/*
++ * Here we define two Dragon4 entry functions for each type. One of them
++ * accepts the args in a Dragon4_Options struct for convenience, the
++ * other enumerates only the necessary parameters.
++ *
++ * Use a very large string buffer in case anyone tries to output a large number.
++ * 16384 should be enough to exactly print the integer part of any float128,
++ * which goes up to about 10^4932. The Dragon4_scratch struct provides a string
++ * buffer of this size.
++ */
++#define make_dragon4_typefuncs_inner(Type, npy_type, format) \
++\
++PyObject *\
++Dragon4_Positional_##Type##_opt(npy_type *val, Dragon4_Options *opt)\
++{\
++    PyObject *ret;\
++    Dragon4_Scratch *scratch = get_dragon4_bigint_scratch();\
++    if (scratch == NULL) {\
++        return NULL;\
++    }\
++    if (Dragon4_PrintFloat_##format(scratch, val, opt) < 0) {\
++        free_dragon4_bigint_scratch(scratch);\
++        return NULL;\
++    }\
++    ret = PyUString_FromString(scratch->repr);\
++    free_dragon4_bigint_scratch(scratch);\
++    return ret;\
++}\
++\
++PyObject *\
++Dragon4_Positional_##Type(npy_type *val, DigitMode digit_mode,\
++                   CutoffMode cutoff_mode, int precision,\
++                   int sign, TrimMode trim, int pad_left, int pad_right)\
++{\
++    Dragon4_Options opt;\
++    \
++    opt.scientific = 0;\
++    opt.digit_mode = digit_mode;\
++    opt.cutoff_mode = cutoff_mode;\
++    opt.precision = precision;\
++    opt.sign = sign;\
++    opt.trim_mode = trim;\
++    opt.digits_left = pad_left;\
++    opt.digits_right = pad_right;\
++    opt.exp_digits = -1;\
++\
++    return Dragon4_Positional_##Type##_opt(val, &opt);\
++}\
++\
++PyObject *\
++Dragon4_Scientific_##Type##_opt(npy_type *val, Dragon4_Options *opt)\
++{\
++    PyObject *ret;\
++    Dragon4_Scratch *scratch = get_dragon4_bigint_scratch();\
++    if (scratch == NULL) {\
++        return NULL;\
++    }\
++    if (Dragon4_PrintFloat_##format(scratch, val, opt) < 0) {\
++        free_dragon4_bigint_scratch(scratch);\
++        return NULL;\
++    }\
++    ret = PyUString_FromString(scratch->repr);\
++    free_dragon4_bigint_scratch(scratch);\
++    return ret;\
++}\
++PyObject *\
++Dragon4_Scientific_##Type(npy_type *val, DigitMode digit_mode, int precision,\
++                   int sign, TrimMode trim, int pad_left, int exp_digits)\
++{\
++    Dragon4_Options opt;\
++\
++    opt.scientific = 1;\
++    opt.digit_mode = digit_mode;\
++    opt.cutoff_mode = CutoffMode_TotalLength;\
++    opt.precision = precision;\
++    opt.sign = sign;\
++    opt.trim_mode = trim;\
++    opt.digits_left = pad_left;\
++    opt.digits_right = -1;\
++    opt.exp_digits = exp_digits;\
++\
++    return Dragon4_Scientific_##Type##_opt(val, &opt);\
++}
++
++#define make_dragon4_typefuncs(Type, npy_type, format) \
++        make_dragon4_typefuncs_inner(Type, npy_type, format)
++
++make_dragon4_typefuncs(Half, npy_half, NPY_HALF_BINFMT_NAME)
++make_dragon4_typefuncs(Float, npy_float, NPY_FLOAT_BINFMT_NAME)
++make_dragon4_typefuncs(Double, npy_double, NPY_DOUBLE_BINFMT_NAME)
++make_dragon4_typefuncs(LongDouble, npy_longdouble, NPY_LONGDOUBLE_BINFMT_NAME)
++
++#undef make_dragon4_typefuncs
++#undef make_dragon4_typefuncs_inner
++
+ PyObject *
+ Dragon4_Positional(PyObject *obj, DigitMode digit_mode, CutoffMode cutoff_mode,
+                    int precision, int sign, TrimMode trim, int pad_left,
+                    int pad_right)
+ {
+-    double val;
++    npy_double val;
++    Dragon4_Options opt;
++
++    opt.scientific = 0;
++    opt.digit_mode = digit_mode;
++    opt.cutoff_mode = cutoff_mode;
++    opt.precision = precision;
++    opt.sign = sign;
++    opt.trim_mode = trim;
++    opt.digits_left = pad_left;
++    opt.digits_right = pad_right;
++    opt.exp_digits = -1;
+ 
+     if (PyArray_IsScalar(obj, Half)) {
+         npy_half x = ((PyHalfScalarObject *)obj)->obval;
+-        return Dragon4_Positional_AnySize(&x, sizeof(npy_half),
+-                                          digit_mode, cutoff_mode, precision,
+-                                          sign, trim, pad_left, pad_right);
++        return Dragon4_Positional_Half_opt(&x, &opt);
+     }
+     else if (PyArray_IsScalar(obj, Float)) {
+         npy_float x = ((PyFloatScalarObject *)obj)->obval;
+-        return Dragon4_Positional_AnySize(&x, sizeof(npy_float),
+-                                          digit_mode, cutoff_mode, precision,
+-                                          sign, trim, pad_left, pad_right);
++        return Dragon4_Positional_Float_opt(&x, &opt);
+     }
+     else if (PyArray_IsScalar(obj, Double)) {
+         npy_double x = ((PyDoubleScalarObject *)obj)->obval;
+-        return Dragon4_Positional_AnySize(&x, sizeof(npy_double),
+-                                          digit_mode, cutoff_mode, precision,
+-                                          sign, trim, pad_left, pad_right);
++        return Dragon4_Positional_Double_opt(&x, &opt);
+     }
+     else if (PyArray_IsScalar(obj, LongDouble)) {
+         npy_longdouble x = ((PyLongDoubleScalarObject *)obj)->obval;
+-        return Dragon4_Positional_AnySize(&x, sizeof(npy_longdouble),
+-                                          digit_mode, cutoff_mode, precision,
+-                                          sign, trim, pad_left, pad_right);
++        return Dragon4_Positional_LongDouble_opt(&x, &opt);
+     }
+ 
+     val = PyFloat_AsDouble(obj);
+     if (PyErr_Occurred()) {
+         return NULL;
+     }
+-    return Dragon4_Positional_AnySize(&val, sizeof(double),
+-                                      digit_mode, cutoff_mode, precision,
+-                                      sign, trim, pad_left, pad_right);
+-}
+-
+-PyObject *
+-Dragon4_Scientific_AnySize(void *val, size_t size, DigitMode digit_mode,
+-                           int precision, int sign, TrimMode trim,
+-                           int pad_left, int exp_digits)
+-{
+-    /* use a very large buffer in case anyone tries to output a large precision */
+-    static char repr[4096];
+-    FloatVal128 val128;
+-#ifdef NPY_FLOAT80
+-    FloatUnion80 buf80;;
+-#endif
+-#ifdef NPY_FLOAT96
+-    FloatUnion96 buf96;
+-#endif
+-#ifdef NPY_FLOAT128
+-    FloatUnion128 buf128;
+-#endif
+-
+-    /* dummy, is ignored in scientific mode */
+-    CutoffMode cutoff_mode = CutoffMode_TotalLength;
+-
+-    switch (size) {
+-        case 2:
+-            Dragon4_PrintFloat16(repr, sizeof(repr), *(npy_float16*)val,
+-                                 1, digit_mode, cutoff_mode, precision, sign,
+-                                 trim, pad_left, -1, exp_digits);
+-            break;
+-        case 4:
+-            Dragon4_PrintFloat32(repr, sizeof(repr), *(npy_float32*)val,
+-                                 1, digit_mode, cutoff_mode, precision, sign,
+-                                 trim, pad_left, -1, exp_digits);
+-            break;
+-        case 8:
+-            Dragon4_PrintFloat64(repr, sizeof(repr), *(npy_float64*)val,
+-                                 1, digit_mode, cutoff_mode, precision, sign,
+-                                 trim, pad_left, -1, exp_digits);
+-            break;
+-#ifdef NPY_FLOAT80
+-        case 10:
+-            buf80.floatingPoint = *(npy_float80*)val;
+-            val128.integer[0] = buf80.integer.a;
+-            val128.integer[1] = buf80.integer.b;
+-            Dragon4_PrintFloat128(repr, sizeof(repr), val128,
+-                                  1, digit_mode, cutoff_mode, precision, sign,
+-                                  trim, pad_left, -1, exp_digits);
+-            break;
+-#endif
+-#ifdef NPY_FLOAT96
+-        case 12:
+-            buf96.floatingPoint = *(npy_float96*)val;
+-            val128.integer[0] = buf96.integer.a;
+-            val128.integer[1] = buf96.integer.b;
+-            Dragon4_PrintFloat128(repr, sizeof(repr), val128,
+-                                  1, digit_mode, cutoff_mode, precision, sign,
+-                                  trim, pad_left, -1, exp_digits);
+-            break;
+-#endif
+-#ifdef NPY_FLOAT128
+-        case 16:
+-            buf128.floatingPoint = *(npy_float128*)val;
+-            val128.integer[0] = buf128.integer.a;
+-            val128.integer[1] = buf128.integer.b;
+-            Dragon4_PrintFloat128(repr, sizeof(repr), val128,
+-                                  1, digit_mode, cutoff_mode, precision, sign,
+-                                  trim, pad_left, -1, exp_digits);
+-            break;
+-#endif
+-        default:
+-            PyErr_Format(PyExc_ValueError, "unexpected itemsize %zu", size);
+-            return NULL;
+-    }
+-
+-    return PyUString_FromString(repr);
++    return Dragon4_Positional_Double_opt(&val, &opt);
+ }
+ 
+ PyObject *
+ Dragon4_Scientific(PyObject *obj, DigitMode digit_mode, int precision,
+                    int sign, TrimMode trim, int pad_left, int exp_digits)
+ {
+-    double val;
++    npy_double val;
++    Dragon4_Options opt;
++
++    opt.scientific = 1;
++    opt.digit_mode = digit_mode;
++    opt.cutoff_mode = CutoffMode_TotalLength;
++    opt.precision = precision;
++    opt.sign = sign;
++    opt.trim_mode = trim;
++    opt.digits_left = pad_left;
++    opt.digits_right = -1;
++    opt.exp_digits = exp_digits;
+ 
+     if (PyArray_IsScalar(obj, Half)) {
+         npy_half x = ((PyHalfScalarObject *)obj)->obval;
+-        return Dragon4_Scientific_AnySize(&x, sizeof(npy_half),
+-                                          digit_mode, precision,
+-                                          sign, trim, pad_left, exp_digits);
++        return Dragon4_Scientific_Half_opt(&x, &opt);
+     }
+     else if (PyArray_IsScalar(obj, Float)) {
+         npy_float x = ((PyFloatScalarObject *)obj)->obval;
+-        return Dragon4_Scientific_AnySize(&x, sizeof(npy_float),
+-                                          digit_mode, precision,
+-                                          sign, trim, pad_left, exp_digits);
++        return Dragon4_Scientific_Float_opt(&x, &opt);
+     }
+     else if (PyArray_IsScalar(obj, Double)) {
+         npy_double x = ((PyDoubleScalarObject *)obj)->obval;
+-        return Dragon4_Scientific_AnySize(&x, sizeof(npy_double),
+-                                          digit_mode, precision,
+-                                          sign, trim, pad_left, exp_digits);
++        return Dragon4_Scientific_Double_opt(&x, &opt);
+     }
+     else if (PyArray_IsScalar(obj, LongDouble)) {
+         npy_longdouble x = ((PyLongDoubleScalarObject *)obj)->obval;
+-        return Dragon4_Scientific_AnySize(&x, sizeof(npy_longdouble),
+-                                          digit_mode, precision,
+-                                          sign, trim, pad_left, exp_digits);
++        return Dragon4_Scientific_LongDouble_opt(&x, &opt);
+     }
+ 
+     val = PyFloat_AsDouble(obj);
+     if (PyErr_Occurred()) {
+         return NULL;
+     }
+-    return Dragon4_Scientific_AnySize(&val, sizeof(double),
+-                                      digit_mode, precision,
+-                                      sign, trim, pad_left, exp_digits);
++    return Dragon4_Scientific_Double_opt(&val, &opt);
+ }
++
++#undef DEBUG_ASSERT
+diff --git a/numpy/core/src/multiarray/dragon4.h b/numpy/core/src/multiarray/dragon4.h
+index 5559c5157..2b8b4cef4 100644
+--- a/numpy/core/src/multiarray/dragon4.h
++++ b/numpy/core/src/multiarray/dragon4.h
+@@ -40,6 +40,48 @@
+ #include "npy_pycompat.h"
+ #include "numpy/arrayscalars.h"
+ 
++/* Half binary format */
++#define NPY_HALF_BINFMT_NAME IEEE_binary16
++
++/* Float binary format */
++#if NPY_BITSOF_FLOAT == 32
++    #define NPY_FLOAT_BINFMT_NAME IEEE_binary32
++#elif NPY_BITSOF_FLOAT == 64
++    #define NPY_FLOAT_BINFMT_NAME IEEE_binary64
++#else
++    #error No float representation defined
++#endif
++
++/* Double binary format */
++#if NPY_BITSOF_DOUBLE == 32
++    #define NPY_DOUBLE_BINFMT_NAME IEEE_binary32
++#elif NPY_BITSOF_DOUBLE == 64
++    #define NPY_DOUBLE_BINFMT_NAME IEEE_binary64
++#else
++    #error No double representation defined
++#endif
++
++/* LongDouble binary format */
++#if defined(HAVE_LDOUBLE_IEEE_QUAD_BE)
++    #define NPY_LONGDOUBLE_BINFMT_NAME IEEE_binary128_be
++#elif defined(HAVE_LDOUBLE_IEEE_QUAD_LE)
++    #define NPY_LONGDOUBLE_BINFMT_NAME IEEE_binary128_le
++#elif (defined(HAVE_LDOUBLE_IEEE_DOUBLE_LE) || \
++       defined(HAVE_LDOUBLE_IEEE_DOUBLE_BE))
++    #define NPY_LONGDOUBLE_BINFMT_NAME IEEE_binary64
++#elif defined(HAVE_LDOUBLE_INTEL_EXTENDED_12_BYTES_LE)
++    #define NPY_LONGDOUBLE_BINFMT_NAME Intel_extended96
++#elif defined(HAVE_LDOUBLE_INTEL_EXTENDED_16_BYTES_LE)
++    #define NPY_LONGDOUBLE_BINFMT_NAME Intel_extended128
++#elif defined(HAVE_LDOUBLE_MOTOROLA_EXTENDED_12_BYTES_BE)
++    #define NPY_LONGDOUBLE_BINFMT_NAME Motorola_extended96
++#elif (defined(HAVE_LDOUBLE_IBM_DOUBLE_DOUBLE_LE) || \
++       defined(HAVE_LDOUBLE_IBM_DOUBLE_DOUBLE_BE))
++    #define NPY_LONGDOUBLE_BINFMT_NAME IBM_double_double
++#else
++    #error No long double representation defined
++#endif
++
+ typedef enum DigitMode
+ {
+     /* Round digits to print shortest uniquely identifiable number. */
+@@ -64,15 +106,23 @@ typedef enum TrimMode
+     TrimMode_DptZeros,     /* trim trailing zeros & trailing decimal point */
+ } TrimMode;
+ 
+-PyObject *
+-Dragon4_Positional_AnySize(void *val, size_t size, DigitMode digit_mode,
+-                           CutoffMode cutoff_mode, int precision, int sign,
+-                           TrimMode trim, int pad_left, int pad_right);
++#define make_dragon4_typedecl(Type, npy_type) \
++    PyObject *\
++    Dragon4_Positional_##Type(npy_type *val, DigitMode digit_mode,\
++                              CutoffMode cutoff_mode, int precision,\
++                              int sign, TrimMode trim, int pad_left,\
++                              int pad_right);\
++    PyObject *\
++    Dragon4_Scientific_##Type(npy_type *val, DigitMode digit_mode,\
++                              int precision, int sign, TrimMode trim,\
++                              int pad_left, int exp_digits);
+ 
+-PyObject *
+-Dragon4_Scientific_AnySize(void *val, size_t size, DigitMode digit_mode,
+-                           int precision, int sign, TrimMode trim,
+-                           int pad_left, int pad_right);
++make_dragon4_typedecl(Half, npy_half)
++make_dragon4_typedecl(Float, npy_float)
++make_dragon4_typedecl(Double, npy_double)
++make_dragon4_typedecl(LongDouble, npy_longdouble)
++
++#undef make_dragon4_typedecl
+ 
+ PyObject *
+ Dragon4_Positional(PyObject *obj, DigitMode digit_mode, CutoffMode cutoff_mode,
+diff --git a/numpy/core/src/multiarray/scalartypes.c.src b/numpy/core/src/multiarray/scalartypes.c.src
+index c2d4bde66..42d613c90 100644
+--- a/numpy/core/src/multiarray/scalartypes.c.src
++++ b/numpy/core/src/multiarray/scalartypes.c.src
+@@ -432,6 +432,7 @@ gentype_format(PyObject *self, PyObject *args)
+ 
+ /**begin repeat
+  * #name = half, float, double, longdouble#
++ * #Name = Half, Float, Double, LongDouble#
+  * #NAME = HALF, FLOAT, DOUBLE, LONGDOUBLE#
+  * #type = npy_half, npy_float, npy_double, npy_longdouble#
+  * #suff = h, f, d, l#
+@@ -443,12 +444,12 @@ format_@name@(@type@ val, npy_bool scientific,
+               int pad_left, int pad_right, int exp_digits)
+ {
+     if (scientific) {
+-        return Dragon4_Scientific_AnySize(&val, sizeof(@type@),
++        return Dragon4_Scientific_@Name@(&val,
+                         DigitMode_Unique, precision,
+                         sign, trim, pad_left, exp_digits);
+     }
+     else {
+-        return Dragon4_Positional_AnySize(&val, sizeof(@type@),
++        return Dragon4_Positional_@Name@(&val,
+                         DigitMode_Unique, CutoffMode_TotalLength, precision,
+                         sign, trim, pad_left, pad_right);
+     }
+diff --git a/numpy/core/src/npymath/ieee754.c.src b/numpy/core/src/npymath/ieee754.c.src
+index 0370ea6c7..170471f19 100644
+--- a/numpy/core/src/npymath/ieee754.c.src
++++ b/numpy/core/src/npymath/ieee754.c.src
+@@ -183,6 +183,7 @@ static npy_longdouble _nextl(npy_longdouble x, int p)
+ {
+     npy_int64 hx,ihx,ilx;
+     npy_uint64 lx;
++    npy_longdouble u;
+ 
+     GET_LDOUBLE_WORDS64(hx, lx, x);
+     ihx = hx & 0x7fffffffffffffffLL;      /* |hx| */
+@@ -193,7 +194,6 @@ static npy_longdouble _nextl(npy_longdouble x, int p)
+         return x; /* signal the nan */
+     }
+     if(ihx == 0 && ilx == 0) {          /* x == 0 */
+-        npy_longdouble u;
+         SET_LDOUBLE_WORDS64(x, p, 0ULL);/* return +-minsubnormal */
+         u = x * x;
+         if (u == x) {
+@@ -203,7 +203,6 @@ static npy_longdouble _nextl(npy_longdouble x, int p)
+         }
+     }
+ 
+-    npy_longdouble u;
+     if(p < 0) { /* p < 0, x -= ulp */
+         if((hx==0xffefffffffffffffLL)&&(lx==0xfc8ffffffffffffeLL))
+             return x+x; /* overflow, return -inf */
+diff --git a/numpy/core/src/npymath/npy_math_private.h b/numpy/core/src/npymath/npy_math_private.h
+index d75b9e991..e4a919db6 100644
+--- a/numpy/core/src/npymath/npy_math_private.h
++++ b/numpy/core/src/npymath/npy_math_private.h
+@@ -287,8 +287,7 @@ do {                                                            \
+     typedef npy_uint32 ldouble_man_t;
+     typedef npy_uint32 ldouble_exp_t;
+     typedef npy_uint32 ldouble_sign_t;
+-#elif defined(HAVE_LDOUBLE_IEEE_DOUBLE_16_BYTES_BE) || \
+-      defined(HAVE_LDOUBLE_IEEE_DOUBLE_BE)
++#elif defined(HAVE_LDOUBLE_IEEE_DOUBLE_BE)
+     /* 64 bits IEEE double precision aligned on 16 bytes: used by ppc arch on
+      * Mac OS X */
+ 
+@@ -435,8 +434,8 @@ do {                                                            \
+     typedef npy_uint32 ldouble_sign_t;
+ #endif
+ 
+-#if !defined(HAVE_LDOUBLE_DOUBLE_DOUBLE_BE) && \
+-    !defined(HAVE_LDOUBLE_DOUBLE_DOUBLE_LE)
++#if !defined(HAVE_LDOUBLE_IBM_DOUBLE_DOUBLE_BE) && \
++    !defined(HAVE_LDOUBLE_IBM_DOUBLE_DOUBLE_LE)
+ /* Get the sign bit of x. x should be of type IEEEl2bitsrep */
+ #define GET_LDOUBLE_SIGN(x) \
+     (((x).a[LDBL_SIGN_INDEX] & LDBL_SIGN_MASK) >> LDBL_SIGN_SHIFT)
+@@ -477,7 +476,7 @@ do {                                                            \
+      ((x).a[LDBL_MANH_INDEX] & ~LDBL_MANH_MASK) |                       \
+      (((IEEEl2bitsrep_part)(v) << LDBL_MANH_SHIFT) & LDBL_MANH_MASK))
+ 
+-#endif /* #ifndef HAVE_LDOUBLE_DOUBLE_DOUBLE_BE */
++#endif /* !HAVE_LDOUBLE_DOUBLE_DOUBLE_* */
+ 
+ /*
+  * Those unions are used to convert a pointer of npy_cdouble to native C99
+diff --git a/numpy/core/src/private/npy_config.h b/numpy/core/src/private/npy_config.h
+index 107b3cb5b..8143e7719 100644
+--- a/numpy/core/src/private/npy_config.h
++++ b/numpy/core/src/private/npy_config.h
+@@ -15,7 +15,8 @@
+  * amd64 is not harmed much by the bloat as the system provides 16 byte
+  * alignment by default.
+  */
+-#if (defined NPY_CPU_X86 || defined _WIN32)
++#if (defined NPY_CPU_X86 || defined _WIN32 || defined NPY_CPU_ARMEL_AARCH32 ||\
++     defined NPY_CPU_ARMEB_AARCH32)
+ #define NPY_MAX_COPY_ALIGNMENT 8
+ #else
+ #define NPY_MAX_COPY_ALIGNMENT 16
+diff --git a/numpy/core/src/private/npy_fpmath.h b/numpy/core/src/private/npy_fpmath.h
+index 86b9cf3da..dbb3fb23d 100644
+--- a/numpy/core/src/private/npy_fpmath.h
++++ b/numpy/core/src/private/npy_fpmath.h
+@@ -7,45 +7,24 @@
+ #include "numpy/npy_cpu.h"
+ #include "numpy/npy_common.h"
+ 
+-#ifdef NPY_OS_DARWIN
+-    /* This hardcoded logic is fragile, but universal builds makes it
+-     * difficult to detect arch-specific features */
+-
+-    /* MAC OS X < 10.4 and gcc < 4 does not support proper long double, and
+-     * is the same as double on those platforms */
+-    #if NPY_BITSOF_LONGDOUBLE == NPY_BITSOF_DOUBLE
+-        /* This assumes that FPU and ALU have the same endianness */
+-        #if NPY_BYTE_ORDER == NPY_LITTLE_ENDIAN
+-            #define HAVE_LDOUBLE_IEEE_DOUBLE_LE
+-        #elif NPY_BYTE_ORDER == NPY_BIG_ENDIAN
+-            #define HAVE_LDOUBLE_IEEE_DOUBLE_BE
+-        #else
+-            #error Endianness undefined ?
+-        #endif
+-    #else
+-        #if defined(NPY_CPU_X86)
+-            #define HAVE_LDOUBLE_INTEL_EXTENDED_12_BYTES_LE
+-        #elif defined(NPY_CPU_AMD64)
+-            #define HAVE_LDOUBLE_INTEL_EXTENDED_16_BYTES_LE
+-        #elif defined(NPY_CPU_PPC) || defined(NPY_CPU_PPC64)
+-            #define HAVE_LDOUBLE_IEEE_DOUBLE_16_BYTES_BE
+-        #elif defined(NPY_CPU_PPC64LE)
+-            #define HAVE_LDOUBLE_IEEE_DOUBLE_16_BYTES_LE
+-        #endif
+-    #endif
+-#endif
+-
+ #if !(defined(HAVE_LDOUBLE_IEEE_QUAD_BE) || \
+       defined(HAVE_LDOUBLE_IEEE_QUAD_LE) || \
+       defined(HAVE_LDOUBLE_IEEE_DOUBLE_LE) || \
+       defined(HAVE_LDOUBLE_IEEE_DOUBLE_BE) || \
+-      defined(HAVE_LDOUBLE_IEEE_DOUBLE_16_BYTES_BE) || \
+       defined(HAVE_LDOUBLE_INTEL_EXTENDED_16_BYTES_LE) || \
+       defined(HAVE_LDOUBLE_INTEL_EXTENDED_12_BYTES_LE) || \
+       defined(HAVE_LDOUBLE_MOTOROLA_EXTENDED_12_BYTES_BE) || \
+-      defined(HAVE_LDOUBLE_DOUBLE_DOUBLE_BE) || \
+-      defined(HAVE_LDOUBLE_DOUBLE_DOUBLE_LE))
++      defined(HAVE_LDOUBLE_IBM_DOUBLE_DOUBLE_BE) || \
++      defined(HAVE_LDOUBLE_IBM_DOUBLE_DOUBLE_LE))
+     #error No long double representation defined
+ #endif
+ 
++/* for back-compat, also keep old name for double-double */
++#ifdef HAVE_LDOUBLE_IBM_DOUBLE_DOUBLE_LE
++    #define HAVE_LDOUBLE_DOUBLE_DOUBLE_LE
++#endif
++#ifdef HAVE_LDOUBLE_IBM_DOUBLE_DOUBLE_BE
++    #define HAVE_LDOUBLE_DOUBLE_DOUBLE_BE
++#endif
++
+ #endif
+diff --git a/numpy/core/tests/test_scalarprint.py b/numpy/core/tests/test_scalarprint.py
+index 61774617d..10fbb8b74 100644
+--- a/numpy/core/tests/test_scalarprint.py
++++ b/numpy/core/tests/test_scalarprint.py
+@@ -5,8 +5,9 @@
+ from __future__ import division, absolute_import, print_function
+ 
+ import numpy as np
+-from numpy.testing import assert_, assert_equal, run_module_suite
++from numpy.testing import assert_, assert_equal, run_module_suite, dec
+ import sys, tempfile
++import platform
+ 
+ 
+ class TestRealScalars(object):
+@@ -217,6 +218,66 @@ class TestRealScalars(object):
+                          "1.2" if tp != np.float16 else "1.2002")
+             assert_equal(fpos(tp('1.'), trim='-'), "1")
+ 
++    @dec.skipif(not platform.machine().startswith("ppc64"),
++                "only applies to ppc float128 values")
++    def test_ppc64_ibm_double_double128(self):
++        # check that the precision decreases once we get into the subnormal
++        # range. Unlike float64, this starts around 1e-292 instead of 1e-308,
++        # which happens when the first double is normal and the second is
++        # subnormal.
++        x = np.float128('2.123123123123123123123123123123123e-286')
++        got = [str(x/np.float128('2e' + str(i))) for i in range(0,40)]
++        expected = [
++            "1.06156156156156156156156156156157e-286",
++            "1.06156156156156156156156156156158e-287",
++            "1.06156156156156156156156156156159e-288",
++            "1.0615615615615615615615615615616e-289",
++            "1.06156156156156156156156156156157e-290",
++            "1.06156156156156156156156156156156e-291",
++            "1.0615615615615615615615615615616e-292",
++            "1.0615615615615615615615615615615e-293",
++            "1.061561561561561561561561561562e-294",
++            "1.06156156156156156156156156155e-295",
++            "1.0615615615615615615615615616e-296",
++            "1.06156156156156156156156156e-297",
++            "1.06156156156156156156156157e-298",
++            "1.0615615615615615615615616e-299",
++            "1.06156156156156156156156e-300",
++            "1.06156156156156156156155e-301",
++            "1.0615615615615615615616e-302",
++            "1.061561561561561561562e-303",
++            "1.06156156156156156156e-304",
++            "1.0615615615615615618e-305",
++            "1.06156156156156156e-306",
++            "1.06156156156156157e-307",
++            "1.0615615615615616e-308",
++            "1.06156156156156e-309",
++            "1.06156156156157e-310",
++            "1.0615615615616e-311",
++            "1.06156156156e-312",
++            "1.06156156154e-313",
++            "1.0615615616e-314",
++            "1.06156156e-315",
++            "1.06156155e-316",
++            "1.061562e-317",
++            "1.06156e-318",
++            "1.06155e-319",
++            "1.0617e-320",
++            "1.06e-321",
++            "1.04e-322",
++            "1e-323",
++            "0.0",
++            "0.0"]
++        assert_equal(got, expected)
++
++        # Note: we follow glibc behavior, but it (or gcc) might not be right.
++        # In particular we can get two values that print the same but are not
++        # equal:
++        a = np.float128('2')/np.float128('3')
++        b = np.float128(str(a))
++        assert_equal(str(a), str(b))
++        assert_(a != b)
++
+     def float32_roundtrip(self):
+         # gh-9360
+         x = np.float32(1024 - 2**-14)
+diff --git a/numpy/core/tests/test_umath.py b/numpy/core/tests/test_umath.py
+index bebeddc92..09d1bbeaf 100644
+--- a/numpy/core/tests/test_umath.py
++++ b/numpy/core/tests/test_umath.py
+@@ -2515,8 +2515,10 @@ def test_nextafter():
+ def test_nextafterf():
+     return _test_nextafter(np.float32)
+ 
+-@dec.knownfailureif(sys.platform == 'win32',
+-            "Long double support buggy on win32, ticket 1664.")
++@dec.skipif(np.finfo(np.double) == np.finfo(np.longdouble),
++            "long double is same as double")
++@dec.knownfailureif(platform.machine().startswith("ppc64"),
++                    "IBM double double")
+ def test_nextafterl():
+     return _test_nextafter(np.longdouble)
+ 
+@@ -2544,8 +2546,10 @@ def test_spacing():
+ def test_spacingf():
+     return _test_spacing(np.float32)
+ 
+-@dec.knownfailureif(sys.platform == 'win32',
+-            "Long double support buggy on win32, ticket 1664.")
++@dec.skipif(np.finfo(np.double) == np.finfo(np.longdouble),
++            "long double is same as double")
++@dec.knownfailureif(platform.machine().startswith("ppc64"),
++                    "IBM double double")
+ def test_spacingl():
+     return _test_spacing(np.longdouble)
+ 
+diff --git a/numpy/ma/tests/test_core.py b/numpy/ma/tests/test_core.py
+index 708c12e8f..1b4702142 100644
+--- a/numpy/ma/tests/test_core.py
++++ b/numpy/ma/tests/test_core.py
+@@ -3278,18 +3278,13 @@ class TestMaskedArrayMethods(object):
+         assert_equal(test.mask, mask_first.mask)
+ 
+         # Test sort on dtype with subarray (gh-8069)
++        # Just check that the sort does not error, structured array subarrays
++        # are treated as byte strings and that leads to differing behavior
++        # depending on endianess and `endwith`.
+         dt = np.dtype([('v', int, 2)])
+         a = a.view(dt)
+-        mask_last = mask_last.view(dt)
+-        mask_first = mask_first.view(dt)
+-
+         test = sort(a)
+-        assert_equal(test, mask_last)
+-        assert_equal(test.mask, mask_last.mask)
+-
+         test = sort(a, endwith=False)
+-        assert_equal(test, mask_first)
+-        assert_equal(test.mask, mask_first.mask)
+ 
+     def test_argsort(self):
+         # Test argsort
+-- 
+2.17.2
+
