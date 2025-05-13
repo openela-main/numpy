@@ -14,8 +14,8 @@
 %global modname numpy
 
 Name:           numpy
-Version:        1.20.1
-Release:        5%{?dist}
+Version:        1.23.5
+Release:        1%{?dist}
 Epoch:          1
 Summary:        A fast multidimensional array facility for Python
 
@@ -23,7 +23,7 @@ Summary:        A fast multidimensional array facility for Python
 License:        BSD and Python and ASL 2.0
 URL:            http://www.numpy.org/
 Source0:        https://github.com/%{name}/%{name}/releases/download/v%{version}/%{name}-%{version}.tar.gz
-Source1:        https://numpy.org/doc/1.19/numpy-html.zip
+Source1:        https://numpy.org/doc/1.23/numpy-html.zip
 
 %description
 NumPy is a general-purpose array-processing package designed to
@@ -52,7 +52,7 @@ Obsoletes:      numpy < 1:1.10.1-3
 BuildRequires:  python3-devel
 BuildRequires:  python3-setuptools
 BuildRequires:  python3-Cython
-BuildRequires:  gcc-gfortran gcc
+BuildRequires:  gcc-gfortran gcc gcc-c++
 BuildRequires:  lapack-devel
 %if %{with tests}
 BuildRequires:  python3-hypothesis
@@ -183,12 +183,19 @@ python3 runtests.py
 %{_bindir}/f2py.numpy
 %{_bindir}/f2py%{python3_version}
 %{python3_sitearch}/%{name}/f2py
+%{python3_sitearch}/%{name}/array_api/
+%{python3_sitearch}/%{name}/_pyinstaller/
+%{python3_sitearch}/%{name}/_typing/
 
 %files -n python3-numpy-doc
 %doc docs/*
 
 
 %changelog
+* Tue Oct 08 2024 Pavel Simovec <psimovec@redhat.com> - 1:1.23.5-1
+- Update to 1.23.5
+- Resolves: RHEL-5520
+
 * Tue Feb 08 2022 Tomas Orsava <torsava@redhat.com> - 1.20.1-5
 - Add automatically generated Obsoletes tag with the python39- prefix
   for smoother upgrade from RHEL8
