@@ -20,7 +20,7 @@
 
 Name:           numpy
 Version:        1.26.4
-Release:        5%{?dist}
+Release:        6%{?dist}
 Epoch:          1
 Summary:        A fast multidimensional array facility for Python
 
@@ -38,6 +38,8 @@ Patch0:         f2py_test.patch
 # Python 3.13: Replace deprecated ctypes.ARRAY(item_type, size) with item_type * size
 # Upstream PR: https://github.com/numpy/numpy/pull/25198
 Patch4:         replace-deprecated-ctypes.ARRAY.patch
+# https://github.com/numpy/numpy/commit/e89ec589000e471f04c71b676c866baec05ecd7d
+Patch5:         fix-ppc64le-power10-test-failures.patch
 
 
 %description
@@ -245,6 +247,9 @@ python3 runtests.py --no-build -- -ra -k 'not test_ppc64_ibm_double_double128 %{
 
 
 %changelog
+* Tue Feb 03 2026 Lukáš Zaoral <lzaoral@redhat.com> - 1:1.26.4-6
+- fix ppc64le test failures (RHEL-77878)
+
 * Tue Oct 29 2024 Troy Dawson <tdawson@redhat.com> - 1:1.26.4-5
 - Bump release for October 2024 mass rebuild:
   Resolves: RHEL-64018
