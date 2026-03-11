@@ -1,0 +1,47 @@
+From e89ec589000e471f04c71b676c866baec05ecd7d Mon Sep 17 00:00:00 2001
+From: Sandeep Gupta <sandeep.gupta12@ibm.com>
+Date: Thu, 9 Oct 2025 22:42:35 +0530
+Subject: [PATCH] BUG: Fix INT_MIN % -1 to return 0 for all signed integer
+ types (#29893)
+
+* BUG: Fix INT_MIN % -1 to return 0 for all signed integer types
+
+- Explicitly check for INT_MIN % -1 in scalar tail loops for fmod and remainder kernels.
+- Set result to 0 to avoid undefined behavior and match NumPy/Python expectations.
+- Ensures correct, portable behavior on all platforms (e.g., PPC64LE).
+
+* Apply suggestion from @seberg
+
+---------
+
+Co-authored-by: Sebastian Berg <sebastian@sipsolutions.net>
+---
+ numpy/_core/src/umath/loops_modulo.dispatch.c.src | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/numpy/core/src/umath/loops_modulo.dispatch.c.src b/numpy/core/src/umath/loops_modulo.dispatch.c.src
+index 032cc3344060..4645fe14a487 100644
+--- a/numpy/core/src/umath/loops_modulo.dispatch.c.src
++++ b/numpy/core/src/umath/loops_modulo.dispatch.c.src
+@@ -490,12 +490,16 @@ vsx4_simd_@func@_by_scalar_contig_@sfx@(char **args, npy_intp len)
+ #else /* fmod and remainder */
+     for (; len > 0; --len, ++src1, ++dst1) {
+         const npyv_lanetype_@sfx@ a = *src1;
+-        *dst1 = a % scalar;
++        if (NPY_UNLIKELY(a == NPY_MIN_INT@len@ && scalar == -1)) {
++            *dst1 = 0;
++        } else {
++            *dst1 = a % scalar;
+ #if @id@ == 1 /* remainder */
+-        if (!((a > 0) == (scalar > 0) || *dst1 == 0)) {
+-            *dst1 += scalar;
+-        }
++            if (!((a > 0) == (scalar > 0) || *dst1 == 0)) {
++                *dst1 += scalar;
++            }
+ #endif
++        }
+     }
+ #endif
+     npyv_cleanup();
+

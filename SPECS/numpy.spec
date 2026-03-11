@@ -15,7 +15,7 @@
 
 Name:           numpy
 Version:        1.23.5
-Release:        1%{?dist}
+Release:        2%{?dist}
 Epoch:          1
 Summary:        A fast multidimensional array facility for Python
 
@@ -24,6 +24,8 @@ License:        BSD and Python and ASL 2.0
 URL:            http://www.numpy.org/
 Source0:        https://github.com/%{name}/%{name}/releases/download/v%{version}/%{name}-%{version}.tar.gz
 Source1:        https://numpy.org/doc/1.23/numpy-html.zip
+# https://github.com/numpy/numpy/commit/e89ec589000e471f04c71b676c866baec05ecd7d
+Patch0:         fix-ppc64le-power10-test-failures.patch
 
 %description
 NumPy is a general-purpose array-processing package designed to
@@ -192,6 +194,9 @@ python3 runtests.py
 
 
 %changelog
+* Wed Feb 04 2026 Lukáš Zaoral <lzaoral@redhat.com> - 1:1.23.5-2
+- fix ppc64le test failures (RHEL-88575)
+
 * Tue Oct 08 2024 Pavel Simovec <psimovec@redhat.com> - 1:1.23.5-1
 - Update to 1.23.5
 - Resolves: RHEL-5520
