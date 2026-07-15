@@ -1,0 +1,129 @@
+diff --git a/numpy/core/tests/test_scalar_methods.py b/numpy/core/tests/test_scalar_methods.py
+index 18a7bc8..a51e4f1 100644
+--- a/numpy/core/tests/test_scalar_methods.py
++++ b/numpy/core/tests/test_scalar_methods.py
+@@ -2,7 +2,6 @@
+ Test the scalar constructors, which also do type-coercion
+ """
+ import fractions
+-import platform
+ import types
+ from typing import Any, Type
+ 
+@@ -10,6 +9,7 @@
+ import numpy as np
+ 
+ from numpy.testing import assert_equal, assert_raises, IS_MUSL
++from numpy.testing._private.utils import LONG_DOUBLE_IS_IBM_DOUBLE_DOUBLE
+ 
+ 
+ class TestAsIntegerRatio:
+@@ -84,7 +84,7 @@ def test_against_known_values(self):
+                     np.finfo(np.double) == np.finfo(np.longdouble),
+                     reason="long double is same as double"),
+                 pytest.mark.skipif(
+-                    platform.machine().startswith("ppc"),
++                    LONG_DOUBLE_IS_IBM_DOUBLE_DOUBLE,
+                     reason="IBM double double"),
+             ]
+         )
+diff --git a/numpy/core/tests/test_scalarmath.py b/numpy/core/tests/test_scalarmath.py
+index 9977c8b..f8e0a29 100644
+--- a/numpy/core/tests/test_scalarmath.py
++++ b/numpy/core/tests/test_scalarmath.py
+@@ -23,6 +23,8 @@
+ except TypeError:
+     USING_CLANG_CL = False
+ 
++from numpy.testing._private.utils import LONG_DOUBLE_IS_IBM_DOUBLE_DOUBLE
++
+ types = [np.bool_, np.byte, np.ubyte, np.short, np.ushort, np.intc, np.uintc,
+          np.int_, np.uint, np.longlong, np.ulonglong,
+          np.single, np.double, np.longdouble, np.csingle,
+@@ -528,7 +530,7 @@ def test_int_from_infinite_longdouble___int__(self):
+ 
+     @pytest.mark.skipif(np.finfo(np.double) == np.finfo(np.longdouble),
+                         reason="long double is same as double")
+-    @pytest.mark.skipif(platform.machine().startswith("ppc"),
++    @pytest.mark.skipif(LONG_DOUBLE_IS_IBM_DOUBLE_DOUBLE,
+                         reason="IBM double double")
+     def test_int_from_huge_longdouble(self):
+         # Produce a longdouble that would overflow a double,
+diff --git a/numpy/core/tests/test_scalarprint.py b/numpy/core/tests/test_scalarprint.py
+index 98d1f4a..65cdeb3 100644
+--- a/numpy/core/tests/test_scalarprint.py
++++ b/numpy/core/tests/test_scalarprint.py
+@@ -2,13 +2,13 @@
+ 
+ """
+ import code
+-import platform
+ import pytest
+ import sys
+ 
+ from tempfile import TemporaryFile
+ import numpy as np
+ from numpy.testing import assert_, assert_equal, assert_raises, IS_MUSL
++from numpy.testing._private.utils import LONG_DOUBLE_IS_IBM_DOUBLE_DOUBLE
+ 
+ class TestRealScalars:
+     def test_str(self):
+@@ -308,8 +308,8 @@ def test_dragon4_interface(self):
+             assert_equal(fpos(tp('1.'), trim='-'), "1")
+             assert_equal(fpos(tp('1.001'), precision=1, trim='-'), "1")
+ 
+-    @pytest.mark.skipif(not platform.machine().startswith("ppc64"),
+-                        reason="only applies to ppc float128 values")
++    @pytest.mark.skipif(not LONG_DOUBLE_IS_IBM_DOUBLE_DOUBLE,
++                        reason="only applies to ppc double-double values")
+     def test_ppc64_ibm_double_double128(self):
+         # check that the precision decreases once we get into the subnormal
+         # range. Unlike float64, this starts around 1e-292 instead of 1e-308,
+diff --git a/numpy/core/tests/test_umath.py b/numpy/core/tests/test_umath.py
+index 963e740..ec59058 100644
+--- a/numpy/core/tests/test_umath.py
++++ b/numpy/core/tests/test_umath.py
+@@ -20,7 +20,10 @@
+     _gen_alignment_data, assert_array_almost_equal_nulp, IS_WASM, IS_MUSL,
+     IS_PYPY
+     )
+-from numpy.testing._private.utils import _glibc_older_than
++from numpy.testing._private.utils import (
++    LONG_DOUBLE_IS_IBM_DOUBLE_DOUBLE,
++    _glibc_older_than,
++)
+ 
+ UFUNCS = [obj for obj in np.core.umath.__dict__.values()
+          if isinstance(obj, np.ufunc)]
+@@ -4452,7 +4455,7 @@ def test_nextafterf():
+ 
+ @pytest.mark.skipif(np.finfo(np.double) == np.finfo(np.longdouble),
+                     reason="long double is same as double")
+-@pytest.mark.xfail(condition=platform.machine().startswith("ppc64"),
++@pytest.mark.xfail(condition=LONG_DOUBLE_IS_IBM_DOUBLE_DOUBLE,
+                     reason="IBM double double")
+ def test_nextafterl():
+     return _test_nextafter(np.longdouble)
+@@ -4491,7 +4494,7 @@ def test_spacingf():
+ 
+ @pytest.mark.skipif(np.finfo(np.double) == np.finfo(np.longdouble),
+                     reason="long double is same as double")
+-@pytest.mark.xfail(condition=platform.machine().startswith("ppc64"),
++@pytest.mark.xfail(condition=LONG_DOUBLE_IS_IBM_DOUBLE_DOUBLE,
+                     reason="IBM double double")
+ def test_spacingl():
+     return _test_spacing(np.longdouble)
+diff --git a/numpy/testing/_private/utils.py b/numpy/testing/_private/utils.py
+index 28dd656..0a842a9 100644
+--- a/numpy/testing/_private/utils.py
++++ b/numpy/testing/_private/utils.py
+@@ -67,6 +67,9 @@ class KnownFailureException(Exception):
+ if 'musl' in _v:
+     IS_MUSL = True
+ 
++LONG_DOUBLE_IS_IBM_DOUBLE_DOUBLE = (platform.machine().startswith("ppc")
++                                    and str(np.finfo(np.longdouble).max)
++                                    == "1.79769313486231580793728971405301e+308")
+ 
+ def assert_(val, msg=''):
+     """

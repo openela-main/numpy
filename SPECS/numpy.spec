@@ -20,7 +20,7 @@
 
 Name:           numpy
 Version:        1.26.4
-Release:        6%{?dist}
+Release:        7%{?dist}
 Epoch:          1
 Summary:        A fast multidimensional array facility for Python
 
@@ -40,6 +40,8 @@ Patch0:         f2py_test.patch
 Patch4:         replace-deprecated-ctypes.ARRAY.patch
 # https://github.com/numpy/numpy/commit/e89ec589000e471f04c71b676c866baec05ecd7d
 Patch5:         fix-ppc64le-power10-test-failures.patch
+# https://github.com/numpy/numpy/commit/444c98efc6ccddd15bfd313bbf5f69be2a5eb460
+Patch6:         ieee-long-double-ppc64-tests.patch
 
 
 %description
@@ -247,6 +249,9 @@ python3 runtests.py --no-build -- -ra -k 'not test_ppc64_ibm_double_double128 %{
 
 
 %changelog
+* Thu Jun 11 2026 Siteshwar Vashisht <svashisht@redhat.com> - 1:1.26.4-7
+- Fix tests for IEEE long double on PPC (RHEL-145970)
+
 * Tue Feb 03 2026 Lukáš Zaoral <lzaoral@redhat.com> - 1:1.26.4-6
 - fix ppc64le test failures (RHEL-77878)
 
